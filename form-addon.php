@@ -178,6 +178,12 @@ function gfmbn_kicbac_addon_bootstrap() {
 
           $settings = $this->get_plugin_settings();
           $api_key = rgar( $settings, 'api_key' );
+          $formsetting = rgar( $form, 'gravityform-kicbac-payment' );
+
+          if( !rgar( $formsetting, 'enabled' ) ) {
+            // nothing to do if disabled.
+            return;
+          }
 
 
             $kicbac_params = array(
@@ -185,7 +191,6 @@ function gfmbn_kicbac_addon_bootstrap() {
               'security_key' => $api_key
             );
             foreach( $this->get_kicbac_fields() as $key => $value ) {
-              $formsetting = rgar( $form, 'gravityform-kicbac-payment' );
               $formsetting_id = rgar( $formsetting, $key );
               $kicbac_params[$key] = rgar( $entry, $formsetting_id );
             }
@@ -215,9 +220,7 @@ function gfmbn_kicbac_addon_bootstrap() {
 
             // after processing to kicbac for security purposes, will remove and mask all confidential data
             foreach( $this->get_kicbac_secure_fields() as $key => $value ) {
-              $formsetting = rgar( $form, 'gravityform-kicbac-payment' );
               $formsetting_id = rgar( $formsetting, $value );
-
               if ( ! empty( $formsetting_id ) ) {
                 $secure_value = gformmbn_kicbac_secure_field( rgar( $entry, $formsetting_id ) );
                 GFAPI::update_entry_field( $entry['id'], $formsetting_id, $secure_value );

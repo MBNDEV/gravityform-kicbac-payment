@@ -4,7 +4,7 @@
  * Plugin Name: Gravity Forms Kicbac Payment
  * Plugin URI: https://github.com/MBNDEV/gravityform-kicbac-payment
  * Description: Kicbac Payment Gateway for Gravity Forms custom addon by MBNDev
- * Version: 1.0.0
+ * Version: 1.0.1
  * Author: MBNDev
  * Author URI: marketing@mybizniche.com
  * License: GPL-2.0+
