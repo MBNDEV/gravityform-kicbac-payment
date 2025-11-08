@@ -63,7 +63,9 @@ function gfmbn_kicbac_addon_bootstrap() {
           }
           $query_params = array(
             'security_key' => $value,
+            'transaction_id' => strval( mt_rand( 1000000000, 9999999999 ) )
           );
+
           $response = wp_remote_get( GFORMMBN_KICBAC_API_BASE_URL . '/query.php?' . http_build_query( $query_params ));
 
           if ( is_wp_error( $response ) ) {
