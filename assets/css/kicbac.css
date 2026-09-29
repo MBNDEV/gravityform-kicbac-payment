@@ -1,0 +1,32 @@
+/**
+ * Structural rules for the secure fields this addon mounts.
+ *
+ * Collect.js replaces a Gravity Forms input with a cross-origin iframe, and an iframe is
+ * inline and bordered by default, so without this it does not occupy the field's box.
+ * That is the widget working, so it lives with the plugin.
+ *
+ * Nothing here sets a colour, a font or spacing: the look of these fields belongs to the
+ * theme, alongside the rest of the form's styling.
+ */
+
+.gfmbn-kicbac-mount {
+	box-sizing: border-box;
+	width: 100%;
+}
+
+.gfmbn-kicbac-mount iframe {
+	display: block;
+	width: 100%;
+	border: 0;
+}
+
+/*
+ * Collect.js tears the iframes down and rebuilds them on a method switch, so the boxes
+ * sit empty for a moment. Fading them says "working" instead of "broken". It stays
+ * clickable on purpose: whenMounted waits up to 8s before clearing the class, and a
+ * pointer block there would leave the shopper unable to type into the card fields.
+ */
+.gfmbn-kicbac-mount.gfmbn-kicbac-loading {
+	opacity: 0.35;
+	transition: opacity 150ms ease-in-out;
+}

@@ -23,6 +23,7 @@ require_once plugin_dir_path( __FILE__ ) . 'vendor/autoload.php';
 );
 
 define( 'GFORMMBN_KICBAC_API_BASE_URL', 'https://kicbac.transactiongateway.com/api' );
+define( 'GFORMMBN_KICBAC_COLLECTJS_URL', 'https://kicbac.transactiongateway.com/token/Collect.js' );
 
 // kicback response handler xmk
 function gformmbn_kicbac_response_xml_handler( $body ) {
@@ -53,6 +54,30 @@ function gformmbn_kicbac_response_text_handler( $body ) {
 function gformmbn_kicbac_secure_field( $value ) {
   $value = (string) $value;
   return str_repeat('*', strlen($value));
+}
+
+/**
+ * Renders the running order total. The markup is only a placeholder: the amount is
+ * recalculated in the browser from the form's product selections, so the shortcode
+ * has no way to know the figure at render time.
+ */
+add_shortcode( 'kicbac-form-total', 'gformmbn_kicbac_total_shortcode' );
+function gformmbn_kicbac_total_shortcode( $atts ) {
+  $atts = shortcode_atts(
+    array(
+      'currency' => '$',
+      'class'    => '',
+    ),
+    $atts,
+    'kicbac-form-total'
+  );
+
+  return sprintf(
+    '<span class="%s" data-kicbac-total data-kicbac-currency="%s">%s</span>',
+    esc_attr( trim( 'kicbac-form-total ' . $atts['class'] ) ),
+    esc_attr( $atts['currency'] ),
+    esc_html( $atts['currency'] . '0.00' )
+  );
 }
 
 // Form Addon
