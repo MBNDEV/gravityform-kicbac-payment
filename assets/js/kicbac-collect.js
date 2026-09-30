@@ -135,6 +135,10 @@
 	// token would submit the form out from under them.
 	var submitOnToken = false;
 
+	// Last validity Collect.js reported per field. Collect.js only reports on change, so
+	// after a request comes back this is the only record of what is still wrong.
+	var fieldValidity = {};
+
 	var configuredKeys = '';
 
 	// Bumped on every configure so a superseded mount-poll can recognise itself.
@@ -173,6 +177,13 @@
 		error.className = ERROR_CLASS + ' gfield_validation_message gfield_description validation_message';
 		error.textContent = message;
 		container.parentNode.appendChild( error );
+	}
+
+	/** Visible fields Collect.js has reported as invalid and that are still unfixed. */
+	function invalidKeys() {
+		return visibleKeys().filter( function ( key ) {
+			return fieldValidity[ key ] && ! fieldValidity[ key ].valid;
+		} );
 	}
 
 	/** Mapped fields conditional logic is currently showing. */
@@ -316,8 +327,13 @@
 		window.CollectJS.configure( {
 			variant: 'inline',
 			styleSniffer: true,
+			// Without a duration Collect.js never times out, so timeoutCallback below
+			// could not fire and a request that goes quiet left the form locked.
+			timeoutDuration: 10000,
 			fields: fields,
 			validationCallback: function ( field, valid, message ) {
+				fieldValidity[ field ] = { valid: valid, message: message };
+
 				if ( valid ) {
 					clearError( field );
 					return;
@@ -373,6 +389,7 @@
 		// The visible set changed, so any token from the previous set no longer applies.
 		tokenInput.value = '';
 		clearAllErrors();
+		fieldValidity = {};
 		configuredKeys = keys.join( ',' );
 		setLoading( true );
 		configureFor( keys );
@@ -398,6 +415,20 @@
 			// Hold GF's own submit handlers until Collect.js hands back a token.
 			event.preventDefault();
 			event.stopPropagation();
+
+			// Collect.js re-runs validationCallback only when a field's contents change,
+			// so clicking again on still-invalid fields produces no callback and no
+			// token: the button would sit disabled with every error just wiped. Re-show
+			// what is already known to be wrong and leave the button usable.
+			var invalid = invalidKeys();
+
+			if ( invalid.length ) {
+				invalid.forEach( function ( key ) {
+					showError( key, fieldValidity[ key ].message );
+				} );
+
+				return;
+			}
 
 			clearAllErrors();
 			setBusy( true );
