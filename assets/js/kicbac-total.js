@@ -1,10 +1,8 @@
 /**
- * Keeps every [kicbac-form-total] placeholder in step with the mapped product fields.
+ * Keeps every [kicbac-form-total] placeholder in step with the form's priced fields.
  *
- * Gravity Forms deprecated gformCalculateTotalPrice() with no public replacement, and
- * its own total covers every price field on the form. This sums only the one-time and
- * recurring fields the addon is configured to charge, which is what the donor is about
- * to be billed.
+ * Gravity Forms deprecated gformCalculateTotalPrice() with no public replacement, so the
+ * running total is summed here from the field IDs the addon localizes.
  */
 ( function () {
 	'use strict';
@@ -58,15 +56,24 @@
 			total += priceFromChoice( select.value );
 		} );
 
-		// The "Enter an amount" input carries a raw figure instead of a choice value.
-		// GF disables it unless its own choice is selected, which keeps it out of the sum.
+		// A Single Product price and the "Enter an amount" input carry a raw figure
+		// instead of a choice value. GF disables the choice's own input unless that
+		// choice is selected, which keeps it out of the sum.
 		wrapper
 			.querySelectorAll( 'input[type="text"], input[type="number"], input[type="tel"]' )
 			.forEach( function ( input ) {
-				if ( ! input.disabled ) {
+				if ( ! input.disabled && ! input.classList.contains( 'ginput_quantity' ) ) {
 					total += toNumber( input.value );
 				}
 			} );
+
+		// A quantity belongs to the whole field, so it multiplies the amount above
+		// rather than joining it.
+		var quantity = wrapper.querySelector( '.ginput_quantity' );
+
+		if ( quantity && ! quantity.disabled && '' !== quantity.value ) {
+			total *= toNumber( quantity.value );
+		}
 
 		return total;
 	}

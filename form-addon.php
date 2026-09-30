@@ -86,27 +86,38 @@ function gfmbn_kicbac_addon_bootstrap() {
             return ! empty( $form ) && $this->is_gateway_enabled( $form );
         }
 
-        /** Tells the total script which product fields make up the amount being charged. */
+        /** Tells the total script which fields make up the amount being charged. */
         public function localize_total_config( $form, $is_ajax = false ) {
-            $settings = $this->get_form_settings( $form );
-            $fields   = array();
-
-            foreach ( array( 'onetime_product', 'recurring_product' ) as $key ) {
-                $field_id = absint( rgar( $settings, $key ) );
-
-                if ( $field_id ) {
-                    $fields[] = $field_id;
-                }
-            }
-
             wp_localize_script(
                 'gfmbn_kicbac_total',
                 'gfmbnKicbacTotal',
                 array(
                     'formId'        => absint( rgar( $form, 'id' ) ),
-                    'productFields' => $fields,
+                    'productFields' => $this->get_priced_field_ids( $form ),
                 )
             );
+        }
+
+        /**
+         * Every field on the form that carries a price.
+         *
+         * The charge reads only the two mapped product fields, but the donor is shown one
+         * figure for the whole form, so the running total covers all of them — a second
+         * product or an add-on option belongs in what the donor sees. GF's own
+         * is_product_field() is no use here: it counts quantity and total fields, which
+         * would multiply or double the amount.
+         */
+        public function get_priced_field_ids( $form ) {
+            $priced = array( 'product', 'option', 'shipping' );
+            $ids    = array();
+
+            foreach ( (array) rgar( $form, 'fields' ) as $field ) {
+                if ( in_array( (string) $field->type, $priced, true ) ) {
+                    $ids[] = absint( $field->id );
+                }
+            }
+
+            return $ids;
         }
 
         /**
