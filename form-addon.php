@@ -86,38 +86,76 @@ function gfmbn_kicbac_addon_bootstrap() {
             return ! empty( $form ) && $this->is_gateway_enabled( $form );
         }
 
-        /** Tells the total script which fields make up the amount being charged. */
+        /** Tells the total script which fields are priced, and what each choice costs. */
         public function localize_total_config( $form, $is_ajax = false ) {
             wp_localize_script(
                 'gfmbn_kicbac_total',
                 'gfmbnKicbacTotal',
                 array(
                     'formId'        => absint( rgar( $form, 'id' ) ),
-                    'productFields' => $this->get_priced_field_ids( $form ),
+                    'productFields' => $this->get_priced_fields( $form ),
                 )
             );
         }
 
         /**
-         * Every field on the form that carries a price.
+         * Every priced field on the form, each with the price of its choices.
          *
          * The charge reads only the two mapped product fields, but the donor is shown one
          * figure for the whole form, so the running total covers all of them — a second
          * product or an add-on option belongs in what the donor sees. GF's own
-         * is_product_field() is no use here: it counts quantity and total fields, which
-         * would multiply or double the amount.
+         * is_product_field() is no use for picking them: it counts quantity and total
+         * fields, which would multiply or double the amount.
+         *
+         * Prices come from the form object rather than the rendered input, whose
+         * "value|price" format only survives while GF renders the choice itself. A theme
+         * that replaces a choice field with its own markup drops the price half, and the
+         * total then reads that field as free.
          */
-        public function get_priced_field_ids( $form ) {
+        public function get_priced_fields( $form ) {
             $priced = array( 'product', 'option', 'shipping' );
-            $ids    = array();
+            $fields = array();
 
             foreach ( (array) rgar( $form, 'fields' ) as $field ) {
-                if ( in_array( (string) $field->type, $priced, true ) ) {
-                    $ids[] = absint( $field->id );
+                if ( ! in_array( (string) $field->type, $priced, true ) ) {
+                    continue;
+                }
+
+                $quantity = GFCommon::get_product_fields_by_type( $form, array( 'quantity' ), $field->id );
+
+                $fields[] = array(
+                    'id'      => absint( $field->id ),
+                    'choices' => $this->get_choice_prices( $field ),
+                    // A Quantity field sits outside the product's own markup, so the
+                    // script is told where to look for it.
+                    'quantity' => empty( $quantity ) ? 0 : absint( $quantity[0]->id ),
+                    // Set on an Option field: the product it belongs to. GF charges an
+                    // option only while its product is selected.
+                    'product' => absint( rgobj( $field, 'productField' ) ),
+                );
+            }
+
+            return $fields;
+        }
+
+        /** A choice field's prices, keyed by the value the choice posts. */
+        public function get_choice_prices( $field ) {
+            $prices = array();
+
+            foreach ( (array) rgobj( $field, 'choices' ) as $choice ) {
+                $value = rgar( $choice, 'value' );
+
+                // GF posts the label when the field has no separate choice values.
+                if ( rgblank( $value ) && ! rgobj( $field, 'enableChoiceValue' ) ) {
+                    $value = rgar( $choice, 'text' );
+                }
+
+                if ( ! rgblank( $value ) ) {
+                    $prices[ $value ] = GFCommon::to_number( rgar( $choice, 'price' ) );
                 }
             }
 
-            return $ids;
+            return $prices;
         }
 
         /**

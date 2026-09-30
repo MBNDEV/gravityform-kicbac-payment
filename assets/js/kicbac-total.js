@@ -2,7 +2,8 @@
  * Keeps every [kicbac-form-total] placeholder in step with the form's priced fields.
  *
  * Gravity Forms deprecated gformCalculateTotalPrice() with no public replacement, so the
- * running total is summed here from the field IDs the addon localizes.
+ * running total is summed here from the priced fields and choice prices the addon
+ * localizes off the form object.
  */
 ( function () {
 	'use strict';
@@ -28,19 +29,116 @@
 		return isNaN( number ) ? 0 : number;
 	}
 
-	// GF stores a choice's price in the input value as "label|price".
-	function priceFromChoice( value ) {
-		if ( ! value || value.indexOf( '|' ) === -1 ) {
+	/**
+	 * What a selected choice costs.
+	 *
+	 * The localized price map is consulted first: GF's own "label|price" input value is
+	 * only there while GF renders the choice, and a theme that supplies its own markup
+	 * for a choice field posts the bare value instead. The price half of the value is
+	 * the fallback, for a choice added to the rendered form after it was localized.
+	 */
+	function choicePrice( field, value ) {
+		if ( ! value ) {
 			return 0;
 		}
 
-		return toNumber( value.slice( value.lastIndexOf( '|' ) + 1 ) );
+		if ( hasPrice( field, value ) ) {
+			return toNumber( field.choices[ value ] );
+		}
+
+		if ( value.indexOf( '|' ) === -1 ) {
+			return 0;
+		}
+
+		var label = value.slice( 0, value.lastIndexOf( '|' ) );
+
+		return hasPrice( field, label )
+			? toNumber( field.choices[ label ] )
+			: toNumber( value.slice( value.lastIndexOf( '|' ) + 1 ) );
 	}
 
-	function fieldTotal( fieldId ) {
-		var wrapper = document.getElementById( 'field_' + config.formId + '_' + fieldId );
+	function hasPrice( field, value ) {
+		return Object.prototype.hasOwnProperty.call( field.choices, value );
+	}
+
+	function wrapperFor( fieldId ) {
+		return document.getElementById( 'field_' + config.formId + '_' + fieldId );
+	}
+
+	/**
+	 * A field's own price inputs.
+	 *
+	 * Each product input type posts its price somewhere different: "input_<id>.2" for
+	 * Single Product, Hidden Product and Calculation, plain "input_<id>" for a
+	 * user-defined price or shipping, "input_<id>_other" for the figure typed into a
+	 * choice field's "other" option. Matching them by name rather than by class or type
+	 * is what covers all of them: Hidden Product and Calculation post theirs in a hidden
+	 * input, and no two of them share a class. The product name (".1") and the quantity
+	 * (".3") post alongside and are not amounts.
+	 *
+	 * GF disables the "other" input unless its choice is selected, which keeps it out.
+	 */
+	function amountInputs( wrapper, fieldId ) {
+		var isAmount = new RegExp( '^input_' + fieldId + '(\\.2|_other)?$' );
+
+		return [].filter.call(
+			wrapper.querySelectorAll(
+				'input[type="text"], input[type="number"], input[type="tel"], input[type="hidden"]'
+			),
+			function ( input ) {
+				return ! input.disabled && isAmount.test( input.name );
+			}
+		);
+	}
+
+	/**
+	 * How many of the field were ordered.
+	 *
+	 * A quantity multiplies the field's amount rather than joining it. It posts as
+	 * "input_<id>.3" inside the field's own markup, unless the form carries a Quantity
+	 * field for this product, which lives in its own markup elsewhere.
+	 */
+	function quantityFor( field ) {
+		var input = document.querySelector(
+			'#field_' + config.formId + '_' + field.id + ' [name="input_' + field.id + '.3"]'
+		);
+
+		if ( ! input && field.quantity ) {
+			input = document.querySelector(
+				'#field_' + config.formId + '_' + field.quantity + ' [name="input_' + field.quantity + '"]'
+			);
+		}
+
+		if ( ! input || input.disabled || '' === input.value ) {
+			return 1;
+		}
+
+		return toNumber( input.value );
+	}
+
+	// Whether anything is chosen in a field. A field with no choices to make — a Single
+	// Product, a Hidden Product, a price — always counts.
+	function isSelected( fieldId ) {
+		var wrapper = wrapperFor( fieldId );
 
 		if ( ! wrapper ) {
+			return false;
+		}
+
+		var choices = wrapper.querySelectorAll(
+			'input[type="radio"], input[type="checkbox"], select'
+		);
+
+		return ! choices.length || [].some.call( choices, function ( input ) {
+			return 'SELECT' === input.tagName ? '' !== input.value : input.checked;
+		} );
+	}
+
+	function fieldTotal( field ) {
+		var wrapper = wrapperFor( field.id );
+
+		// An Option field costs nothing until its product is chosen.
+		if ( ! wrapper || ( field.product && ! isSelected( field.product ) ) ) {
 			return 0;
 		}
 
@@ -49,40 +147,25 @@
 		wrapper
 			.querySelectorAll( 'input[type="radio"]:checked, input[type="checkbox"]:checked' )
 			.forEach( function ( input ) {
-				total += priceFromChoice( input.value );
+				total += choicePrice( field, input.value );
 			} );
 
 		wrapper.querySelectorAll( 'select' ).forEach( function ( select ) {
-			total += priceFromChoice( select.value );
+			total += choicePrice( field, select.value );
 		} );
 
-		// A Single Product price and the "Enter an amount" input carry a raw figure
-		// instead of a choice value. GF disables the choice's own input unless that
-		// choice is selected, which keeps it out of the sum.
-		wrapper
-			.querySelectorAll( 'input[type="text"], input[type="number"], input[type="tel"]' )
-			.forEach( function ( input ) {
-				if ( ! input.disabled && ! input.classList.contains( 'ginput_quantity' ) ) {
-					total += toNumber( input.value );
-				}
-			} );
+		amountInputs( wrapper, field.id ).forEach( function ( input ) {
+			total += toNumber( input.value );
+		} );
 
-		// A quantity belongs to the whole field, so it multiplies the amount above
-		// rather than joining it.
-		var quantity = wrapper.querySelector( '.ginput_quantity' );
-
-		if ( quantity && ! quantity.disabled && '' !== quantity.value ) {
-			total *= toNumber( quantity.value );
-		}
-
-		return total;
+		return total * quantityFor( field );
 	}
 
 	function render() {
 		var total = 0;
 
-		config.productFields.forEach( function ( fieldId ) {
-			total += fieldTotal( fieldId );
+		config.productFields.forEach( function ( field ) {
+			total += fieldTotal( field );
 		} );
 
 		outputs.forEach( function ( node ) {
