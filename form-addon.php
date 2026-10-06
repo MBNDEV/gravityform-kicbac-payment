@@ -60,6 +60,18 @@ function gfmbn_kicbac_addon_bootstrap() {
                         'enqueue'   => array( array( $this, 'is_total_enabled' ) ),
                         'callback'  => array( $this, 'localize_total_config' ),
                     ),
+                    array(
+                        'handle'    => 'gfmbn_kicbac_admin',
+                        'src'       => plugins_url( 'assets/js/kicbac-admin.js', $this->_full_path ),
+                        'version'   => $this->get_asset_version( 'assets/js/kicbac-admin.js' ),
+                        'in_footer' => true,
+                        'enqueue'   => array(
+                            array(
+                                'admin_page' => array( 'form_settings' ),
+                                'tab'        => $this->_slug,
+                            ),
+                        ),
+                    ),
                 )
             );
         }
@@ -125,6 +137,7 @@ function gfmbn_kicbac_addon_bootstrap() {
 
                 $fields[] = array(
                     'id'      => absint( $field->id ),
+                    'type'    => (string) $field->type,
                     'choices' => $this->get_choice_prices( $field ),
                     // A Quantity field sits outside the product's own markup, so the
                     // script is told where to look for it.
@@ -133,6 +146,31 @@ function gfmbn_kicbac_addon_bootstrap() {
                     // option only while its product is selected.
                     'product' => absint( rgobj( $field, 'productField' ) ),
                 );
+            }
+
+            $priced_ids = wp_list_pluck( $fields, 'id' );
+
+            foreach ( $this->get_product_mappings( $form ) as $row ) {
+                $field = GFAPI::get_field( $form, $row['field_id'] );
+
+                if ( ! $field || in_array( $row['field_id'], $priced_ids, true ) ) {
+                    continue;
+                }
+
+                // A mapped non-product field charges its own value, so each choice is
+                // priced at the number it posts.
+                $choices = array();
+
+                foreach ( is_array( $field->choices ) ? $field->choices : array() as $choice ) {
+                    $value = rgblank( rgar( $choice, 'value' ) ) ? rgar( $choice, 'text' ) : rgar( $choice, 'value' );
+
+                    if ( ! rgblank( $value ) ) {
+                        $choices[ $value ] = (float) GFCommon::to_number( $value );
+                    }
+                }
+
+                $fields[]     = array( 'id' => $row['field_id'], 'type' => (string) $field->type, 'choices' => $choices, 'quantity' => 0, 'product' => 0 );
+                $priced_ids[] = $row['field_id'];
             }
 
             return $fields;
@@ -170,6 +208,8 @@ function gfmbn_kicbac_addon_bootstrap() {
             $form_id  = absint( rgar( $form, 'id' ) );
             $fields   = array();
 
+            $this->collectjs_public_key = $this->get_public_key( $form );
+
             foreach ( $this->get_kicbac_secure_fields() as $key ) {
                 $field_id = absint( rgar( $settings, $key ) );
 
@@ -203,9 +243,29 @@ function gfmbn_kicbac_addon_bootstrap() {
             return file_exists( $file ) ? (string) filemtime( $file ) : $this->_version;
         }
 
+        /**
+         * A Kicbac key for a form: the form's own when it has one, the global one otherwise.
+         * Each key falls back on its own, so a form can override only the keys it needs.
+         *
+         * @param array|null $form Null reads the global key alone.
+         * @param string     $key  api_key, public_key or webhook_signing_key.
+         */
+        public function get_credential( $form, $key ) {
+            $value = $form ? trim( (string) rgar( $this->get_form_settings( $form ), $key ) ) : '';
+
+            return '' !== $value ? $value : trim( (string) rgar( $this->get_plugin_settings(), $key ) );
+        }
+
+        /**
+         * The public key of the form whose Collect.js was enqueued. Collect.js takes one
+         * tokenization key per page, read off its script tag, and the tag is printed long
+         * after the form that chose it is out of scope.
+         */
+        private $collectjs_public_key = '';
+
         /** The Collect.js tokenization key, safe to expose in the browser. */
-        public function get_public_key() {
-            return trim( (string) rgar( $this->get_plugin_settings(), 'public_key' ) );
+        public function get_public_key( $form = null ) {
+            return $this->get_credential( $form, 'public_key' );
         }
 
         public function is_gateway_enabled( $form ) {
@@ -220,7 +280,7 @@ function gfmbn_kicbac_addon_bootstrap() {
          * @param bool  $is_ajax Unused; part of the GF enqueue-condition callback signature.
          */
         public function is_collectjs_enabled( $form, $is_ajax = false ) {
-            return ! empty( $form ) && $this->is_gateway_enabled( $form ) && $this->get_public_key() !== '';
+            return ! empty( $form ) && $this->is_gateway_enabled( $form ) && $this->get_public_key( $form ) !== '';
         }
 
         /**
@@ -234,7 +294,7 @@ function gfmbn_kicbac_addon_bootstrap() {
 
             return str_replace(
                 ' src=',
-                ' data-tokenization-key="' . esc_attr( $this->get_public_key() ) . '" src=',
+                ' data-tokenization-key="' . esc_attr( $this->collectjs_public_key ) . '" src=',
                 $tag
             );
         }
@@ -305,6 +365,11 @@ function gfmbn_kicbac_addon_bootstrap() {
         }
 
 
+        /** Unlike the global key, a per-form key is optional: empty shows no verdict at all. */
+        public function is_valid_form_api_key( $value ) {
+            return '' === trim( (string) $value ) ? null : $this->is_valid_api_key( $value );
+        }
+
         public function get_kicbac_fields() {
           return array(
             'company' => 'Company',
@@ -355,20 +420,25 @@ function gfmbn_kicbac_addon_bootstrap() {
         /** Enable Feeds UI on each form (Forms → your form → Settings → MBN Kicbac Payment) */
         public function form_settings_fields( $form ) {
 
-          $fields = array();
+          $fields  = array();
+          $choices = array_merge(
+            array( array( 'value' => '', 'label' => esc_html__( 'Select a field', 'gravityform-kicbac-payment' ) ) ),
+            $this->get_mappable_field_choices( $form )
+          );
 
           foreach( $this->get_kicbac_fields() as $key => $value ) {
             $fields[] = array(
-              'label' => esc_html__( $value . " Field ID", 'gravityform-kicbac-payment' ),
-              'type' => 'text',
-              'name' => $key,
+              'label'   => esc_html__( $value, 'gravityform-kicbac-payment' ),
+              'type'    => 'select',
+              'name'    => $key,
+              'choices' => $choices,
             );
           }
 
           return array(
               array(
                   'title'  => esc_html__( 'Kicbac Payment Gateway Setup', 'gravityform-kicbac-payment' ),
-                  'description' => esc_html__( 'Map the product field IDs that drive the charge. A value in the one-time field bills a single sale, a value in the recurring field starts a subscription.', 'gravityform-kicbac-payment' ),
+                  'description' => esc_html__( 'Map the fields that drive the charge. One-time amounts are added up into a single sale; recurring amounts start a subscription per billing schedule.', 'gravityform-kicbac-payment' ),
                   'fields' => array(
                       array(
                           'type'    => 'checkbox',
@@ -381,20 +451,50 @@ function gfmbn_kicbac_addon_bootstrap() {
                           ),
                       ),
                       array(
-                          'label' => esc_html__( 'One-time Product Field ID', 'gravityform-kicbac-payment' ),
-                          'type'  => 'text',
-                          'name'  => 'onetime_product',
+                          'label'         => esc_html__( 'Product Mappings', 'gravityform-kicbac-payment' ),
+                          'type'          => 'kicbac_products',
+                          'name'          => 'product_mappings',
+                          'default_value' => $this->get_product_mappings( $form ),
+                          'save_callback' => array( $this, 'save_product_mappings' ),
+                      ),
+                  ),
+              ),
+              array(
+                  'title'       => esc_html__( 'Kicbac Credentials for this Form', 'gravityform-kicbac-payment' ),
+                  'description' => esc_html__( 'Optional. Fill these only when this form charges a different Kicbac account. Any key left empty uses the global one under Forms → Settings → MBN Kicbac Payment.', 'gravityform-kicbac-payment' ),
+                  'fields'      => array(
+                      array(
+                          'name'              => 'api_key',
+                          'label'             => esc_html__( 'Kicbac Security Key', 'gravityform-kicbac-payment' ),
+                          'type'              => 'text',
+                          'input_type'        => 'password',
+                          'class'             => 'medium',
+                          'feedback_callback' => array( $this, 'is_valid_form_api_key' ),
                       ),
                       array(
-                          'label' => esc_html__( 'Recurring Product Field ID', 'gravityform-kicbac-payment' ),
-                          'type'  => 'text',
-                          'name'  => 'recurring_product',
+                          'name'        => 'public_key',
+                          'label'       => esc_html__( 'Public Security Key', 'gravityform-kicbac-payment' ),
+                          'type'        => 'text',
+                          'class'       => 'medium',
+                          'description' => esc_html__( 'Collect.js tokenization key for this account. A form with its own Security Key needs its own Public Key too, or the card is tokenized against the other account.', 'gravityform-kicbac-payment' ),
+                      ),
+                      array(
+                          'name'        => 'webhook_signing_key',
+                          'label'       => esc_html__( 'Webhook Signing Key', 'gravityform-kicbac-payment' ),
+                          'type'        => 'text',
+                          'input_type'  => 'password',
+                          'class'       => 'medium',
+                          'description' => sprintf(
+                              /* translators: %s: the webhook endpoint URL to paste into Kicbac. */
+                              esc_html__( 'Signing key of the webhook set up in this account. Point it at: %s', 'gravityform-kicbac-payment' ),
+                              '<code>' . esc_url( $this->get_webhook_url() ) . '</code>'
+                          ),
                       ),
                   ),
               ),
               array(
                   'title'  => esc_html__( 'Kicbac Payment Gateway Data Mapping for Customers Vault', 'gravityform-kicbac-payment' ),
-                  'description' => esc_html__( 'Map your form field IDs to Kicbac Payment Gateway fields, Leaving empty will be ignored.', 'gravityform-kicbac-payment' )
+                  'description' => esc_html__( 'Pick the form field that holds each Kicbac value. Anything left unselected is not sent.', 'gravityform-kicbac-payment' )
                       . '<br /><br />' . sprintf(
                           /* translators: 1: the [kicbac-form-total] shortcode, 2: the Gravity Forms field type it belongs in. */
                           esc_html__( 'Running total: put %1$s in a Gravity Forms %2$s field to show what the donor is about to be charged. It adds up the product fields above and updates in the browser as the selection changes. A Paragraph field will not work — it prints the shortcode as text instead of running it.', 'gravityform-kicbac-payment' ),
@@ -405,6 +505,161 @@ function gfmbn_kicbac_addon_bootstrap() {
               ),
           );
       }
+
+        /** Billing choices for a product mapping, keyed by the stored value. */
+        public function get_billing_choices() {
+            return array(
+                'onetime' => esc_html__( 'One-time', 'gravityform-kicbac-payment' ),
+                'monthly' => esc_html__( 'Recurring - Monthly', 'gravityform-kicbac-payment' ),
+                'yearly'  => esc_html__( 'Recurring - Yearly', 'gravityform-kicbac-payment' ),
+                'custom'  => esc_html__( 'Recurring - Every N months', 'gravityform-kicbac-payment' ),
+            );
+        }
+
+        /**
+         * The form's product mappings, normalised. Forms saved before mappings existed
+         * carry a single one-time and a single recurring field ID; those are read as
+         * rows so the form keeps charging the same way until it is next saved.
+         */
+        public function get_product_mappings( $form ) {
+            $settings = $this->get_form_settings( $form );
+            $rows     = rgar( $settings, 'product_mappings' );
+
+            if ( ! is_array( $rows ) ) {
+                $rows = array(
+                    array( 'field_id' => rgar( $settings, 'onetime_product' ), 'billing' => 'onetime' ),
+                    array( 'field_id' => rgar( $settings, 'recurring_product' ), 'billing' => 'monthly' ),
+                );
+            }
+
+            return $this->sanitize_product_mappings( $rows );
+        }
+
+        public function sanitize_product_mappings( $rows ) {
+            $billing = $this->get_billing_choices();
+            $clean   = array();
+
+            foreach ( (array) $rows as $row ) {
+                $field_id = absint( rgar( (array) $row, 'field_id' ) );
+
+                if ( ! $field_id ) {
+                    continue;
+                }
+
+                $type = (string) rgar( $row, 'billing' );
+
+                $clean[] = array(
+                    'field_id' => $field_id,
+                    'billing'  => isset( $billing[ $type ] ) ? $type : 'onetime',
+                    // Kicbac accepts a month_frequency of 1 to 24.
+                    'months'   => min( 24, max( 1, (int) rgar( $row, 'months' ) ) ),
+                    'payments' => max( 0, (int) rgar( $row, 'payments' ) ),
+                );
+            }
+
+            return $clean;
+        }
+
+        public function save_product_mappings( $field, $value ) {
+            return $this->sanitize_product_mappings( is_string( $value ) ? json_decode( $value, true ) : $value );
+        }
+
+        /** Fields that can hold a value; layout-only fields are left out. */
+        public function get_form_field_list( $form ) {
+            return array_filter( (array) rgar( $form, 'fields' ), function ( $field ) {
+                return ! in_array( $field->type, array( 'html', 'section', 'page', 'captcha' ), true );
+            } );
+        }
+
+        public function get_field_choice_label( $field, $input = null ) {
+            $label = GFCommon::get_label( $field );
+
+            if ( $input ) {
+                return sprintf( '%s - %s (ID %s, %s)', $label, rgar( $input, 'label' ), rgar( $input, 'id' ), $field->type );
+            }
+
+            return sprintf( '%s (ID %d, %s)', $label, $field->id, $field->type );
+        }
+
+        /**
+         * Dropdown choices for the Customer Vault mapping. Name and Address fields store
+         * each part under its own input ID and nothing under the field ID, so they are
+         * offered part by part.
+         */
+        public function get_mappable_field_choices( $form ) {
+            $choices = array();
+
+            foreach ( $this->get_form_field_list( $form ) as $field ) {
+                if ( in_array( $field->get_input_type(), array( 'name', 'address' ), true ) && is_array( $field->inputs ) ) {
+                    foreach ( $field->inputs as $input ) {
+                        if ( ! rgar( $input, 'isHidden' ) ) {
+                            $choices[] = array( 'value' => (string) $input['id'], 'label' => $this->get_field_choice_label( $field, $input ) );
+                        }
+                    }
+
+                    continue;
+                }
+
+                $choices[] = array( 'value' => (string) $field->id, 'label' => $this->get_field_choice_label( $field ) );
+            }
+
+            return $choices;
+        }
+
+        /** GF prints no description for a callback-rendered field, so the help sits in its markup. */
+        public function get_product_mappings_help() {
+            return '<ul class="gform-settings-description" style="list-style:disc;margin-left:1.5em">'
+                . '<li>' . esc_html__( 'Field: the form field holding the amount. Any field works: a Product field, or a Number, text, hidden or choice field whose value is the amount.', 'gravityform-kicbac-payment' ) . '</li>'
+                . '<li>' . esc_html__( 'Billing: One-time amounts are added up into a single charge. Recurring amounts start a subscription; rows with the same schedule share one.', 'gravityform-kicbac-payment' ) . '</li>'
+                . '<li>' . esc_html__( 'Every (months): how often an "Every N months" gift bills, 1 to 24. Monthly and Yearly set it for you.', 'gravityform-kicbac-payment' ) . '</li>'
+                . '<li>' . esc_html__( 'Payments: how many times a recurring gift bills before it stops on its own. 0 bills until the donor or you cancel it. Example: Monthly with 12 payments is a one-year pledge; Every 3 months with 4 payments is four quarterly charges. Not used for One-time.', 'gravityform-kicbac-payment' ) . '</li>'
+                . '</ul>';
+        }
+
+        /**
+         * Renders the repeatable product mapping rows. The rows themselves are drawn and
+         * serialised into the hidden input by kicbac-admin.js.
+         */
+        public function settings_kicbac_products( $field, $echo = true ) {
+            $products = array();
+
+            foreach ( $this->get_form_field_list( $this->get_current_form() ) as $form_field ) {
+                $products[] = array(
+                    'id'    => absint( $form_field->id ),
+                    'label' => $this->get_field_choice_label( $form_field ),
+                );
+            }
+
+            $html = sprintf(
+                '<div class="gfmbn-kicbac-products" data-products="%s" data-billing="%s" data-labels="%s">'
+                . '<input type="hidden" name="_gform_setting_%s" value="%s" />'
+                . '<table class="widefat striped"><thead><tr><th>%s</th><th>%s</th><th>%s</th><th>%s</th><th></th></tr></thead><tbody></tbody></table>'
+                . '<p><button type="button" class="button gfmbn-kicbac-add">%s</button></p>'
+                . '%s'
+                . '</div>',
+                esc_attr( wp_json_encode( $products ) ),
+                esc_attr( wp_json_encode( $this->get_billing_choices() ) ),
+                esc_attr( wp_json_encode( array(
+                    'remove' => __( 'Remove', 'gravityform-kicbac-payment' ),
+                    'select'  => __( 'Select a field', 'gravityform-kicbac-payment' ),
+                    'missing' => __( 'Deleted field', 'gravityform-kicbac-payment' ),
+                ) ) ),
+                esc_attr( $field->name ),
+                esc_attr( wp_json_encode( $this->sanitize_product_mappings( $field->get_value() ) ) ),
+                esc_html__( 'Field', 'gravityform-kicbac-payment' ),
+                esc_html__( 'Billing', 'gravityform-kicbac-payment' ),
+                esc_html__( 'Every (months)', 'gravityform-kicbac-payment' ),
+                esc_html__( 'Payments', 'gravityform-kicbac-payment' ),
+                esc_html__( 'Add field', 'gravityform-kicbac-payment' ),
+                $this->get_product_mappings_help()
+            );
+
+            if ( $echo ) {
+                echo $html; // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- escaped above.
+            }
+
+            return $html;
+        }
 
         /** Field IDs on this form that Collect.js collects instead of Gravity Forms. */
         public function get_tokenized_field_ids( $form ) {
@@ -521,10 +776,14 @@ function gfmbn_kicbac_addon_bootstrap() {
                     continue;
                 }
 
+                $parts = explode( ',', $value );
+
                 // Amounts are stored exactly as sent to the gateway; format for reading.
                 if ( in_array( $key, array( 'payment_amount', 'subscription_amount' ), true ) ) {
-                    $value = GFCommon::to_money( $value );
+                    $parts = array_map( array( 'GFCommon', 'to_money' ), $parts );
                 }
+
+                $value = implode( ', ', $parts );
 
                 $rows[ $label ] = $value;
             }
@@ -611,8 +870,9 @@ function gfmbn_kicbac_addon_bootstrap() {
             return absint(
                 $wpdb->get_var(
                     $wpdb->prepare(
-                        "SELECT entry_id FROM {$table} WHERE meta_key = %s AND meta_value = %s ORDER BY entry_id DESC LIMIT 1",
+                        "SELECT entry_id FROM {$table} WHERE meta_key = %s AND ( meta_value = %s OR FIND_IN_SET( %s, meta_value ) ) ORDER BY entry_id DESC LIMIT 1",
                         self::META_PREFIX . $key,
+                        $value,
                         $value
                     )
                 )
@@ -637,20 +897,7 @@ function gfmbn_kicbac_addon_bootstrap() {
         }
 
         public function handle_webhook( $request ) {
-            $signing_key = trim( (string) rgar( $this->get_plugin_settings(), 'webhook_signing_key' ) );
-
-            if ( '' === $signing_key ) {
-                return new WP_REST_Response( array( 'message' => 'Webhook handling is disabled.' ), 503 );
-            }
-
-            $body = $request->get_body();
-
-            if ( ! $this->is_valid_webhook_signature( $request->get_header( 'webhook_signature' ), $body, $signing_key ) ) {
-                $this->log_error( __METHOD__ . '(): rejected a webhook with a missing or invalid signature.' );
-
-                return new WP_REST_Response( array( 'message' => 'Invalid signature.' ), 401 );
-            }
-
+            $body    = $request->get_body();
             $payload = json_decode( $body, true );
 
             if ( ! is_array( $payload ) ) {
@@ -667,6 +914,23 @@ function gfmbn_kicbac_addon_bootstrap() {
 
             if ( ! $entry_id ) {
                 $entry_id = $this->find_entry_by_meta( 'subscription_id', $subscription_id );
+            }
+
+            // The entry is looked up before the signature is checked because a form with
+            // its own Kicbac account signs with its own key; nothing is written until the
+            // signature passes.
+            $entry       = $entry_id ? GFAPI::get_entry( $entry_id ) : null;
+            $form        = is_array( $entry ) ? GFAPI::get_form( $entry['form_id'] ) : null;
+            $signing_key = $this->get_credential( $form ?: null, 'webhook_signing_key' );
+
+            if ( '' === $signing_key ) {
+                return new WP_REST_Response( array( 'message' => 'Webhook handling is disabled.' ), 503 );
+            }
+
+            if ( ! $this->is_valid_webhook_signature( $request->get_header( 'webhook_signature' ), $body, $signing_key ) ) {
+                $this->log_error( __METHOD__ . '(): rejected a webhook with a missing or invalid signature.' );
+
+                return new WP_REST_Response( array( 'message' => 'Invalid signature.' ), 401 );
             }
 
             if ( ! $entry_id ) {
@@ -687,7 +951,8 @@ function gfmbn_kicbac_addon_bootstrap() {
                 $meta['transaction_id'] = $transaction_id;
             }
 
-            if ( $subscription_id ) {
+            // An entry with several subscriptions keeps its ID list intact.
+            if ( $subscription_id && '' === $this->get_payment_meta( $entry_id, 'subscription_id' ) ) {
                 $meta['subscription_id'] = $subscription_id;
             }
 
@@ -726,8 +991,7 @@ function gfmbn_kicbac_addon_bootstrap() {
         /** The main action: send entry to your API */
         public function process_feed( $entry, $form ) {
 
-          $settings = $this->get_plugin_settings();
-          $api_key = rgar( $settings, 'api_key' );
+          $api_key = $this->get_credential( $form, 'api_key' );
           $formsetting = rgar( $form, 'gravityform-kicbac-payment' );
 
           if( !rgar( $formsetting, 'enabled' ) ) {
@@ -737,29 +1001,35 @@ function gfmbn_kicbac_addon_bootstrap() {
 
             $token     = $this->get_submitted_token();
             $params    = $this->build_gateway_params( $entry, $form, $api_key );
-            $onetime   = $this->get_product_amount( $form, $entry, rgar( $formsetting, 'onetime_product' ) );
-            $recurring = $this->get_product_amount( $form, $entry, rgar( $formsetting, 'recurring_product' ) );
+            $charges   = $this->get_charges( $form, $entry );
+            $onetime   = $charges['onetime'];
+            $schedules = $charges['recurring'];
 
-            if ( $onetime > 0 && $recurring > 0 ) {
-              // A Collect.js token can only be charged once, so a donor giving both a
-              // one-time and a recurring gift is vaulted first and billed twice against
-              // the stored customer.
+            if ( ( $onetime > 0 ? 1 : 0 ) + count( $schedules ) > 1 ) {
+              // A Collect.js token can only be charged once, so a donor giving more than
+              // one gift is vaulted first and each gift is billed against the stored
+              // customer.
               $vault_id = $this->process_customer_vault( $entry, $params );
 
               if ( $vault_id ) {
-                $vault_params = array(
+                $params = array(
                   'security_key'      => $api_key,
                   'customer_vault_id' => $vault_id,
                 );
-                $this->process_sale( $entry, $vault_params, $onetime );
-                $this->process_subscription( $entry, $vault_params, $recurring );
+              } else {
+                $onetime   = 0;
+                $schedules = array();
               }
-            } elseif ( $onetime > 0 ) {
-              $this->process_sale( $entry, $params, $onetime );
-            } elseif ( $recurring > 0 ) {
-              $this->process_subscription( $entry, $params, $recurring );
-            } else {
+            } elseif ( 0 === $onetime && empty( $schedules ) ) {
               $this->process_customer_vault( $entry, $params );
+            }
+
+            if ( $onetime > 0 ) {
+              $this->process_sale( $entry, $params, $onetime );
+            }
+
+            foreach ( $schedules as $schedule ) {
+              $this->process_subscription( $entry, $params, $schedule );
             }
 
             // Tokenized submissions never store card data in the first place, so there is
@@ -801,12 +1071,62 @@ function gfmbn_kicbac_addon_bootstrap() {
             return $params;
         }
 
-        /** Total for one mapped product field, including its options and quantity. */
+        /**
+         * What the entry owes, from the form's product mappings: one-time products summed
+         * into a single sale, recurring products summed per billing schedule so products
+         * that bill alike share one subscription.
+         *
+         * @return array { onetime: float, recurring: array of { amount, months, payments } }
+         */
+        public function get_charges( $form, $entry ) {
+            $onetime   = 0;
+            $recurring = array();
+
+            foreach ( $this->get_product_mappings( $form ) as $row ) {
+                $amount = $this->get_product_amount( $form, $entry, $row['field_id'] );
+
+                if ( $amount <= 0 ) {
+                    continue;
+                }
+
+                if ( 'onetime' === $row['billing'] ) {
+                    $onetime += $amount;
+                    continue;
+                }
+
+                $months = array( 'monthly' => 1, 'yearly' => 12 );
+                $months = isset( $months[ $row['billing'] ] ) ? $months[ $row['billing'] ] : $row['months'];
+                $key    = $months . ':' . $row['payments'];
+
+                if ( ! isset( $recurring[ $key ] ) ) {
+                    $recurring[ $key ] = array( 'amount' => 0, 'months' => $months, 'payments' => $row['payments'] );
+                }
+
+                $recurring[ $key ]['amount'] += $amount;
+            }
+
+            return array(
+                'onetime'   => $onetime,
+                'recurring' => array_values( $recurring ),
+            );
+        }
+
+        /**
+         * Total for one mapped field. A Product field is priced by GF, with its options
+         * and quantity; any other field is read as an amount, so a Number, text,
+         * hidden or choice field can drive the charge too.
+         */
         public function get_product_amount( $form, $entry, $field_id ) {
             $field_id = absint( $field_id );
 
-            if ( ! $field_id ) {
+            $field    = $field_id ? GFAPI::get_field( $form, $field_id ) : false;
+
+            if ( ! $field ) {
               return 0;
+            }
+
+            if ( 'product' !== $field->type ) {
+              return $this->get_field_value_amount( $field, $entry );
             }
 
             $products = GFCommon::get_product_fields( $form, $entry );
@@ -833,6 +1153,18 @@ function gfmbn_kicbac_addon_bootstrap() {
             }
 
             return $total;
+        }
+
+        /** A non-product field's submitted value as a number; a checkbox sums its ticks. */
+        public function get_field_value_amount( $field, $entry ) {
+            $value = RGFormsModel::get_lead_field_value( $entry, $field );
+            $total = 0;
+
+            foreach ( (array) $value as $part ) {
+              $total += (float) GFCommon::to_number( $part, rgar( $entry, 'currency' ) );
+            }
+
+            return max( 0, $total );
         }
 
         public function post_to_gateway( $endpoint, $params ) {
@@ -881,24 +1213,30 @@ function gfmbn_kicbac_addon_bootstrap() {
             }
         }
 
-        /** Starts the recurring gift as a monthly subscription. */
-        public function process_subscription( $entry, $params, $amount ) {
-            $params['recurring']     = 'add_subscription';
-            $params['plan_amount']   = number_format( $amount, 2, '.', '' );
-            $params['plan_payments'] = 0; // bill until the donor cancels
-            $params['month_frequency'] = 1;
-            // Clamped to 28 so a gift started on the 29th-31st still bills every month.
-            $params['day_of_month']  = min( (int) current_time( 'j' ), 28 );
-            $params['orderid']       = $entry['id'];
+        /**
+         * Starts one recurring gift.
+         *
+         * @param array $schedule { amount, months, payments } from get_charges().
+         */
+        public function process_subscription( $entry, $params, $schedule ) {
+            $params['recurring']       = 'add_subscription';
+            $params['plan_amount']     = number_format( $schedule['amount'], 2, '.', '' );
+            $params['plan_payments']   = $schedule['payments']; // 0 bills until the donor cancels
+            $params['month_frequency'] = $schedule['months'];
+            // Clamped to 28 so a gift started on the 29th-31st still bills every cycle.
+            $params['day_of_month']    = min( (int) current_time( 'j' ), 28 );
+            $params['orderid']         = $entry['id'];
 
+            $cycle    = $this->get_billing_cycle_label( $schedule['months'], $schedule['payments'] );
             $response = $this->post_to_gateway( 'transact.php', $params );
 
             if ( is_wp_error( $response ) ) {
-              $this->update_payment_meta( $entry['id'], array(
+              $this->add_subscription_meta( $entry['id'], array(
                 'subscription_status' => 'Failed',
                 'subscription_amount' => $params['plan_amount'],
-                'response_text'       => $response->get_error_message(),
+                'billing_cycle'       => $cycle,
               ) );
+              $this->update_payment_meta( $entry['id'], array( 'response_text' => $response->get_error_message() ) );
               $this->add_note( $entry['id'], 'Recurring gift failed: API submission error', 'error' );
               $this->log_error( __METHOD__ . '(): ' . $response->get_error_message() );
               return;
@@ -907,24 +1245,50 @@ function gfmbn_kicbac_addon_bootstrap() {
             $ret    = gformmbn_kicbac_response_text_handler( wp_remote_retrieve_body( $response ) );
             $status = $this->get_response_status( $ret );
 
-            $this->update_payment_meta( $entry['id'], array(
+            $this->add_subscription_meta( $entry['id'], array(
               'subscription_status' => 'Approved' === $status ? 'Active' : $status,
               'subscription_id'     => rgar( $ret, 'subscription_id' ),
               'subscription_amount' => $params['plan_amount'],
-              'billing_cycle'       => 'Monthly',
-              'response_text'       => rgar( $ret, 'responsetext' ),
-              'next_charge_date'    => 'Approved' === $status ? $this->calculate_next_charge_date( $params['day_of_month'] ) : '',
+              'billing_cycle'       => $cycle,
+              'next_charge_date'    => 'Approved' === $status ? $this->calculate_next_charge_date( $params['day_of_month'], $schedule['months'] ) : '',
             ) );
+            $this->update_payment_meta( $entry['id'], array( 'response_text' => rgar( $ret, 'responsetext' ) ) );
 
             if ( 'Approved' === $status ) {
               $this->add_note(
                 $entry['id'],
-                sprintf( 'Recurring gift started at %s/month. Subscription ID %s', $params['plan_amount'], rgar( $ret, 'subscription_id' ) ),
+                sprintf( 'Recurring gift started at %s, %s. Subscription ID %s', $params['plan_amount'], $cycle, rgar( $ret, 'subscription_id' ) ),
                 'success'
               );
             } else {
               $this->add_note( $entry['id'], 'Recurring gift was not started: ' . rgar( $ret, 'responsetext' ), 'error' );
             }
+        }
+
+        public function get_billing_cycle_label( $months, $payments ) {
+            if ( 1 === (int) $months ) {
+                $label = 'Monthly';
+            } elseif ( 12 === (int) $months ) {
+                $label = 'Yearly';
+            } else {
+                $label = sprintf( 'Every %d months', $months );
+            }
+
+            return $payments ? sprintf( '%s (%d payments)', $label, $payments ) : $label;
+        }
+
+        /**
+         * An entry can start more than one subscription, one per billing schedule, so
+         * each subscription field holds a comma-separated list in subscription order.
+         * Commas without spaces, so find_entry_by_meta() can match one ID with FIND_IN_SET.
+         */
+        public function add_subscription_meta( $entry_id, $data ) {
+            foreach ( $data as $key => $value ) {
+                $existing     = $this->get_payment_meta( $entry_id, $key );
+                $data[ $key ] = '' === $existing ? $value : $existing . ',' . $value;
+            }
+
+            $this->update_payment_meta( $entry_id, $data );
         }
 
         /**
@@ -996,11 +1360,11 @@ function gfmbn_kicbac_addon_bootstrap() {
         }
 
         /**
-         * A new subscription bills immediately, then on $day_of_month each following month.
+         * A new subscription bills immediately, then on $day_of_month every $months months.
          * The webhook replaces this with the gateway's own figure once it reports one.
          */
-        public function calculate_next_charge_date( $day_of_month ) {
-            $next_month = strtotime( 'first day of next month', current_time( 'timestamp' ) );
+        public function calculate_next_charge_date( $day_of_month, $months = 1 ) {
+            $next_month = strtotime( sprintf( 'first day of +%d month', $months ), current_time( 'timestamp' ) );
 
             return gmdate(
                 'Y-m-d',

@@ -332,6 +332,13 @@
 			timeoutDuration: 10000,
 			fields: fields,
 			validationCallback: function ( field, valid, message ) {
+				// After a card/ACH switch Collect.js still reports the fields of the set it
+				// was configured with before, as empty. Counting those would cancel the
+				// pending submit and strand the token of the set actually in use.
+				if ( keys.indexOf( field ) === -1 ) {
+					return;
+				}
+
 				fieldValidity[ field ] = { valid: valid, message: message };
 
 				if ( valid ) {

@@ -96,10 +96,11 @@
 	 *
 	 * A quantity multiplies the field's amount rather than joining it. It posts as
 	 * "input_<id>.3" inside the field's own markup, unless the form carries a Quantity
-	 * field for this product, which lives in its own markup elsewhere.
+	 * field for this product, which lives in its own markup elsewhere. Only a Product
+	 * field has that input: on a checkbox field "input_<id>.3" is the third choice.
 	 */
 	function quantityFor( field ) {
-		var input = document.querySelector(
+		var input = 'product' === field.type && document.querySelector(
 			'#field_' + config.formId + '_' + field.id + ' [name="input_' + field.id + '.3"]'
 		);
 
