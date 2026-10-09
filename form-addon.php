@@ -246,14 +246,28 @@ function gfmbn_kicbac_addon_bootstrap() {
         /**
          * A Kicbac key for a form: the form's own when it has one, the global one otherwise.
          * Each key falls back on its own, so a form can override only the keys it needs.
+         * In test mode the test_ variant is read instead, and never falls back to a live key,
+         * so a missing test key can't put a sandbox charge through the live account.
          *
          * @param array|null $form Null reads the global key alone.
          * @param string     $key  api_key, public_key or webhook_signing_key.
          */
         public function get_credential( $form, $key ) {
-            $value = $form ? trim( (string) rgar( $this->get_form_settings( $form ), $key ) ) : '';
+            $form_settings = $form ? $this->get_form_settings( $form ) : array();
+
+            if ( $this->is_test_mode( $form ) ) {
+                $key = 'test_' . $key;
+            }
+
+            $value = trim( (string) rgar( $form_settings, $key ) );
 
             return '' !== $value ? $value : trim( (string) rgar( $this->get_plugin_settings(), $key ) );
+        }
+
+        /** Test mode is on when the form or the global settings enable it. */
+        public function is_test_mode( $form = null ) {
+            return (bool) rgar( $this->get_plugin_settings(), 'test_mode' )
+                || ( $form && (bool) rgar( $this->get_form_settings( $form ), 'test_mode' ) );
         }
 
         /**
@@ -333,6 +347,53 @@ function gfmbn_kicbac_addon_bootstrap() {
                                 '<code>' . esc_url( $this->get_webhook_url() ) . '</code>'
                             ),
                         )
+                    ),
+                ),
+                array(
+                    'title'       => esc_html__( 'Kicbac Test Mode', 'gravityform-kicbac-payment' ),
+                    'description' => esc_html__( 'While test mode is on, every form charges, tokenizes and verifies webhooks with the test keys below instead of the live ones.', 'gravityform-kicbac-payment' ),
+                    'fields'      => $this->get_test_credential_fields(),
+                ),
+            );
+        }
+
+        /** Test mode toggle and the sandbox keys it switches to; shared by plugin and form settings. */
+        public function get_test_credential_fields() {
+            return array(
+                array(
+                    'type'    => 'checkbox',
+                    'name'    => 'test_mode',
+                    'choices' => array(
+                        array(
+                            'label' => esc_html__( 'Enable test mode (sandbox)', 'gravityform-kicbac-payment' ),
+                            'name'  => 'test_mode',
+                        ),
+                    ),
+                ),
+                array(
+                    'name'              => 'test_api_key',
+                    'label'             => esc_html__( 'Test Security Key', 'gravityform-kicbac-payment' ),
+                    'type'              => 'text',
+                    'input_type'        => 'password',
+                    'class'             => 'medium',
+                    'feedback_callback' => array( $this, 'is_valid_form_api_key' ),
+                ),
+                array(
+                    'name'  => 'test_public_key',
+                    'label' => esc_html__( 'Test Public Security Key', 'gravityform-kicbac-payment' ),
+                    'type'  => 'text',
+                    'class' => 'medium',
+                ),
+                array(
+                    'name'        => 'test_webhook_signing_key',
+                    'label'       => esc_html__( 'Test Webhook Signing Key', 'gravityform-kicbac-payment' ),
+                    'type'        => 'text',
+                    'input_type'  => 'password',
+                    'class'       => 'medium',
+                    'description' => sprintf(
+                        /* translators: %s: the webhook endpoint URL to paste into Kicbac. */
+                        esc_html__( 'Signing key of the webhook set up in the test account. Point it at: %s', 'gravityform-kicbac-payment' ),
+                        '<code>' . esc_url( $this->get_webhook_url() ) . '</code>'
                     ),
                 ),
             );
@@ -491,6 +552,11 @@ function gfmbn_kicbac_addon_bootstrap() {
                           ),
                       ),
                   ),
+              ),
+              array(
+                  'title'       => esc_html__( 'Kicbac Test Mode for this Form', 'gravityform-kicbac-payment' ),
+                  'description' => esc_html__( 'Test mode is on when it is enabled here or globally. Any test key left empty uses the global test key.', 'gravityform-kicbac-payment' ),
+                  'fields'      => $this->get_test_credential_fields(),
               ),
               array(
                   'title'  => esc_html__( 'Kicbac Payment Gateway Data Mapping for Customers Vault', 'gravityform-kicbac-payment' ),
