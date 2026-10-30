@@ -70,6 +70,7 @@ function gfmbn_kicbac_addon_bootstrap() {
                                 'admin_page' => array( 'form_settings', 'plugin_settings' ),
                                 'tab'        => $this->_slug,
                             ),
+                            array( 'admin_page' => array( 'entry_view' ) ),
                         ),
                     ),
                 )
@@ -893,11 +894,16 @@ function gfmbn_kicbac_addon_bootstrap() {
                 'order_id'            => esc_html__( 'Order ID', 'gravityform-kicbac-payment' ),
                 'transaction_id'      => esc_html__( 'Transaction ID', 'gravityform-kicbac-payment' ),
                 'auth_code'           => esc_html__( 'Authorization Code', 'gravityform-kicbac-payment' ),
+                'refunded_amount'     => esc_html__( 'Refunded', 'gravityform-kicbac-payment' ),
+                'refund_transaction_id' => esc_html__( 'Refund Transaction ID', 'gravityform-kicbac-payment' ),
+                'refund_date'         => esc_html__( 'Refund Date', 'gravityform-kicbac-payment' ),
+                'refund_note'         => esc_html__( 'Refund Note', 'gravityform-kicbac-payment' ),
                 'subscription_status' => esc_html__( 'Subscription', 'gravityform-kicbac-payment' ),
                 'subscription_id'     => esc_html__( 'Subscription ID', 'gravityform-kicbac-payment' ),
                 'subscription_amount' => esc_html__( 'Recurring Amount', 'gravityform-kicbac-payment' ),
                 'billing_cycle'       => esc_html__( 'Billing Cycle', 'gravityform-kicbac-payment' ),
                 'next_charge_date'    => esc_html__( 'Next Charge Date', 'gravityform-kicbac-payment' ),
+                'cancel_note'         => esc_html__( 'Cancel Note', 'gravityform-kicbac-payment' ),
                 'customer_vault_id'   => esc_html__( 'Customer Vault ID', 'gravityform-kicbac-payment' ),
                 'response_text'       => esc_html__( 'Gateway Response', 'gravityform-kicbac-payment' ),
             );
@@ -931,7 +937,7 @@ function gfmbn_kicbac_addon_bootstrap() {
                 $parts = explode( ',', $value );
 
                 // Amounts are stored exactly as sent to the gateway; format for reading.
-                if ( in_array( $key, array( 'payment_amount', 'subscription_amount' ), true ) ) {
+                if ( in_array( $key, array( 'payment_amount', 'subscription_amount', 'refunded_amount' ), true ) ) {
                     $parts = array_map( array( 'GFCommon', 'to_money' ), $parts );
                 }
 
@@ -957,6 +963,301 @@ function gfmbn_kicbac_addon_bootstrap() {
             }
 
             echo '</tbody></table>';
+
+            $this->render_refund_control( $entry_id );
+            $this->render_subscription_controls( $entry_id );
+        }
+
+        /** A Cancel button for each subscription of the entry that Kicbac still bills. */
+        public function render_subscription_controls( $entry_id ) {
+            if ( ! GFCommon::current_user_can_any( 'gravityforms_edit_entries' ) ) {
+                return;
+            }
+
+            $ids      = array_filter( explode( ',', $this->get_payment_meta( $entry_id, 'subscription_id' ) ) );
+            $statuses = explode( ',', $this->get_payment_meta( $entry_id, 'subscription_status' ) );
+            $nonce    = wp_create_nonce( 'gfmbn_kicbac_cancel_' . $entry_id );
+            $labels   = wp_json_encode( array(
+                /* translators: %s: Kicbac subscription id. */
+                'confirm'    => __( 'Cancel subscription %s on Kicbac? No further payments will be charged. This cannot be undone.', 'gravityform-kicbac-payment' ),
+                'cancelling' => __( 'Cancelling...', 'gravityform-kicbac-payment' ),
+                'failed'     => __( 'Cancel failed', 'gravityform-kicbac-payment' ),
+            ) );
+
+            foreach ( $ids as $index => $subscription_id ) {
+                if ( ! in_array( rgar( $statuses, $index ), array( 'Active', 'Payment Failed' ), true ) ) {
+                    continue;
+                }
+
+                printf(
+                    '<div class="gfmbn-kicbac-cancel" data-entry-id="%d" data-subscription-id="%s" data-nonce="%s" data-labels="%s" style="margin-top:12px">'
+                    . '<textarea class="gfmbn-kicbac-note" rows="2" placeholder="%s" style="display:block;width:100%%;margin-bottom:6px"></textarea>'
+                    . '<button type="button" class="button button-link-delete">%s</button>'
+                    . '<p class="gfmbn-kicbac-cancel-status" aria-live="polite" style="margin:6px 0 0"></p>'
+                    . '</div>',
+                    absint( $entry_id ),
+                    esc_attr( $subscription_id ),
+                    esc_attr( $nonce ),
+                    esc_attr( $labels ),
+                    esc_attr__( 'Cancellation note (saved on the entry)', 'gravityform-kicbac-payment' ),
+                    /* translators: %s: Kicbac subscription id. */
+                    esc_html( sprintf( __( 'Cancel subscription %s', 'gravityform-kicbac-payment' ), $subscription_id ) )
+                );
+            }
+        }
+
+        /** AJAX: deletes one of the entry's subscriptions on Kicbac and marks it Cancelled. */
+        public function ajax_cancel_subscription() {
+            $entry_id = absint( rgpost( 'entry_id' ) );
+
+            check_ajax_referer( 'gfmbn_kicbac_cancel_' . $entry_id, 'nonce' );
+
+            if ( ! GFCommon::current_user_can_any( 'gravityforms_edit_entries' ) ) {
+                wp_send_json_error( array( 'message' => __( 'You are not allowed to cancel subscriptions.', 'gravityform-kicbac-payment' ) ), 403 );
+            }
+
+            $entry = GFAPI::get_entry( $entry_id );
+
+            if ( is_wp_error( $entry ) ) {
+                wp_send_json_error( array( 'message' => __( 'Entry not found.', 'gravityform-kicbac-payment' ) ), 404 );
+            }
+
+            $error = $this->cancel_subscription( $entry, GFAPI::get_form( $entry['form_id'] ), sanitize_text_field( wp_unslash( rgpost( 'subscription_id' ) ) ), sanitize_textarea_field( wp_unslash( rgpost( 'note' ) ) ) );
+
+            if ( '' !== $error ) {
+                wp_send_json_error( array( 'message' => $error ) );
+            }
+
+            wp_send_json_success();
+        }
+
+        /**
+         * Deletes a subscription of the entry on Kicbac, so it bills no more, and records it Cancelled.
+         *
+         * @return string Kicbac's error, or '' when the subscription was cancelled.
+         */
+        public function cancel_subscription( $entry, $form, $subscription_id, $note = '' ) {
+            $entry_id = absint( $entry['id'] );
+            $ids      = explode( ',', $this->get_payment_meta( $entry_id, 'subscription_id' ) );
+            $index    = array_search( (string) $subscription_id, $ids, true );
+
+            if ( '' === (string) $subscription_id || false === $index ) {
+                return __( 'This subscription does not belong to the entry.', 'gravityform-kicbac-payment' );
+            }
+
+            $ret = $this->send_transaction( array(
+                'security_key'    => $this->get_credential( $form, 'api_key' ),
+                'recurring'       => 'delete_subscription',
+                'subscription_id' => $subscription_id,
+            ) );
+
+            if ( 'Approved' !== $this->get_response_status( $ret ) ) {
+                $error = '' !== (string) rgar( $ret, 'responsetext' ) ? (string) rgar( $ret, 'responsetext' ) : __( 'Kicbac did not cancel the subscription.', 'gravityform-kicbac-payment' );
+
+                $this->add_note( $entry_id, 'Subscription cancel failed: ' . $error, 'error' );
+
+                return $error;
+            }
+
+            $statuses = explode( ',', $this->get_payment_meta( $entry_id, 'subscription_status' ) );
+            $next     = explode( ',', $this->get_payment_meta( $entry_id, 'next_charge_date' ) );
+
+            $statuses[ $index ] = 'Cancelled';
+
+            if ( isset( $next[ $index ] ) ) {
+                $next[ $index ] = '';
+            }
+
+            $this->update_payment_meta( $entry_id, array(
+                'subscription_status' => implode( ',', $statuses ),
+                'next_charge_date'    => implode( ',', $next ),
+                'cancel_note'         => $note,
+                'response_text'       => (string) rgar( $ret, 'responsetext' ),
+            ) );
+
+            $this->add_note( $entry_id, sprintf( 'Subscription %s cancelled on Kicbac. By %s.%s', $subscription_id, wp_get_current_user()->display_name, '' !== $note ? ' Note: ' . $note : '' ), 'success' );
+            $this->fire_status_updated( $entry_id, 'cancel', array( 'subscription_id' => (string) $subscription_id, 'note' => $note ) );
+
+            return '';
+        }
+
+        /**
+         * Fires gfmbn_kicbac_payment_status_updated with the entry's current payment and subscription
+         * state, so other plugins can follow refunds, cancellations and webhook updates.
+         */
+        public function fire_status_updated( $entry_id, $source, $context = array() ) {
+            $state = array();
+
+            foreach ( array( 'payment_status', 'payment_amount', 'refunded_amount', 'transaction_id', 'subscription_status', 'subscription_id', 'subscription_amount', 'next_charge_date' ) as $key ) {
+                $state[ $key ] = $this->get_payment_meta( $entry_id, $key );
+            }
+
+            do_action( 'gfmbn_kicbac_payment_status_updated', absint( $entry_id ), $state, (string) $source, (array) $context );
+        }
+
+        /** What is left to refund on an entry's one-time charge; 0 when nothing can be refunded. */
+        public function get_refundable_amount( $entry_id ) {
+            if ( '' === $this->get_payment_meta( $entry_id, 'transaction_id' ) || ! in_array( $this->get_payment_meta( $entry_id, 'payment_status' ), array( 'Approved', 'Partially Refunded' ), true ) ) {
+                return 0;
+            }
+
+            $paid     = (float) GFCommon::to_number( $this->get_payment_meta( $entry_id, 'payment_amount', 0 ) );
+            $refunded = (float) $this->get_payment_meta( $entry_id, 'refunded_amount', 0 );
+
+            return max( 0, round( $paid - $refunded, 2 ) );
+        }
+
+        /** The Refund amount and button under the payment details; kicbac-admin.js sends it. */
+        public function render_refund_control( $entry_id ) {
+            $refundable = $this->get_refundable_amount( $entry_id );
+
+            if ( $refundable <= 0 || ! GFCommon::current_user_can_any( 'gravityforms_edit_entries' ) ) {
+                return;
+            }
+
+            printf(
+                '<div class="gfmbn-kicbac-refund" data-entry-id="%d" data-nonce="%s" data-labels="%s" style="margin-top:12px">'
+                . '<label for="gfmbn-kicbac-refund-amount" style="display:block;margin-bottom:4px"><strong>%s</strong></label>'
+                . '<input type="number" id="gfmbn-kicbac-refund-amount" step="0.01" min="0.01" max="%s" value="%s" style="width:7em"> '
+                . '<button type="button" class="button">%s</button>'
+                . '<textarea class="gfmbn-kicbac-note" rows="2" placeholder="%s" style="display:block;width:100%%;margin-top:6px"></textarea>'
+                . '<p class="gfmbn-kicbac-refund-status" aria-live="polite" style="margin:6px 0 0"></p>'
+                . '</div>',
+                absint( $entry_id ),
+                esc_attr( wp_create_nonce( 'gfmbn_kicbac_refund_' . $entry_id ) ),
+                esc_attr( wp_json_encode( array(
+                    /* translators: %s: refund amount. */
+                    'confirm'    => __( 'Refund %s to the customer through Kicbac? This cannot be undone.', 'gravityform-kicbac-payment' ),
+                    'refunding'  => __( 'Refunding...', 'gravityform-kicbac-payment' ),
+                    'failed'     => __( 'Refund failed', 'gravityform-kicbac-payment' ),
+                ) ) ),
+                esc_html__( 'Refund amount', 'gravityform-kicbac-payment' ),
+                esc_attr( number_format( $refundable, 2, '.', '' ) ),
+                esc_attr( number_format( $refundable, 2, '.', '' ) ),
+                esc_html__( 'Refund', 'gravityform-kicbac-payment' ),
+                esc_attr__( 'Refund note (saved on the entry)', 'gravityform-kicbac-payment' )
+            );
+        }
+
+        /** AJAX: refunds part or all of an entry's one-time charge and records the new status. */
+        public function ajax_refund() {
+            $entry_id = absint( rgpost( 'entry_id' ) );
+
+            check_ajax_referer( 'gfmbn_kicbac_refund_' . $entry_id, 'nonce' );
+
+            if ( ! GFCommon::current_user_can_any( 'gravityforms_edit_entries' ) ) {
+                wp_send_json_error( array( 'message' => __( 'You are not allowed to refund payments.', 'gravityform-kicbac-payment' ) ), 403 );
+            }
+
+            $entry = GFAPI::get_entry( $entry_id );
+
+            if ( is_wp_error( $entry ) ) {
+                wp_send_json_error( array( 'message' => __( 'Entry not found.', 'gravityform-kicbac-payment' ) ), 404 );
+            }
+
+            $amount     = round( (float) GFCommon::to_number( rgpost( 'amount' ) ), 2 );
+            $refundable = $this->get_refundable_amount( $entry_id );
+
+            if ( $amount <= 0 || $amount > $refundable + 0.001 ) {
+                wp_send_json_error( array(
+                    'message' => sprintf(
+                        /* translators: %s: the most that can still be refunded. */
+                        __( 'Enter an amount between 0.01 and %s.', 'gravityform-kicbac-payment' ),
+                        number_format( $refundable, 2, '.', '' )
+                    ),
+                ) );
+            }
+
+            $result = $this->refund_entry( $entry, GFAPI::get_form( $entry['form_id'] ), $amount, sanitize_textarea_field( wp_unslash( rgpost( 'note' ) ) ) );
+
+            if ( '' !== $result ) {
+                wp_send_json_error( array( 'message' => $result ) );
+            }
+
+            wp_send_json_success( array( 'status' => $this->get_payment_meta( $entry_id, 'payment_status' ) ) );
+        }
+
+        /**
+         * Gives back $amount of the entry's one-time charge. A full refund of an unsettled charge is
+         * voided, which Kicbac only allows before settlement; anything else is refunded.
+         *
+         * @return string Kicbac's error, or '' when the money was returned.
+         */
+        public function refund_entry( $entry, $form, $amount, $note = '' ) {
+            $entry_id       = absint( $entry['id'] );
+            $transaction_id = $this->get_payment_meta( $entry_id, 'transaction_id' );
+            $refundable     = $this->get_refundable_amount( $entry_id );
+            $is_full        = $amount + 0.001 >= $refundable;
+            $paid           = (float) GFCommon::to_number( $this->get_payment_meta( $entry_id, 'payment_amount', 0 ) );
+            $params         = array(
+                'security_key'  => $this->get_credential( $form, 'api_key' ),
+                'transactionid' => $transaction_id,
+                'payment'       => 'check' === rgar( $entry, rgars( $form, 'gravityform-kicbac-payment/payment' ) ) ? 'check' : 'creditcard',
+            );
+
+            $type = 'void';
+            $ret  = array();
+
+            // Only a charge nothing was refunded from yet can be voided as a whole.
+            if ( $is_full && $refundable + 0.001 >= $paid ) {
+                $ret = $this->send_transaction( array_merge( $params, array( 'type' => 'void', 'void_reason' => 'user_cancel' ) ) );
+            }
+
+            if ( 'Approved' !== $this->get_response_status( $ret ) ) {
+                $type = 'refund';
+                $ret  = $this->send_transaction( array_merge( $params, array( 'type' => 'refund', 'amount' => number_format( $amount, 2, '.', '' ) ) ) );
+            }
+
+            if ( 'Approved' !== $this->get_response_status( $ret ) ) {
+                $error = '' !== (string) rgar( $ret, 'responsetext' ) ? (string) rgar( $ret, 'responsetext' ) : __( 'Kicbac did not accept the refund.', 'gravityform-kicbac-payment' );
+
+                $this->add_note( $entry_id, 'Refund failed: ' . $error, 'error' );
+
+                return $error;
+            }
+
+            $refunded = round( (float) $this->get_payment_meta( $entry_id, 'refunded_amount', 0 ) + $amount, 2 );
+            $status   = 'void' === $type ? 'Voided' : ( $refunded + 0.001 >= $paid ? 'Refunded' : 'Partially Refunded' );
+
+            $this->update_payment_meta( $entry_id, array(
+                'payment_status'        => $status,
+                'refunded_amount'       => number_format( $refunded, 2, '.', '' ),
+                'refund_transaction_id' => (string) rgar( $ret, 'transactionid' ),
+                'refund_date'           => current_time( 'mysql' ),
+                'refund_note'           => $note,
+                'response_text'         => (string) rgar( $ret, 'responsetext' ),
+            ) );
+
+            $this->add_note(
+                $entry_id,
+                sprintf(
+                    '%s %s of transaction %s. Kicbac transaction ID %s. By %s.%s',
+                    'void' === $type ? 'Voided' : 'Refunded',
+                    number_format( $amount, 2, '.', '' ),
+                    $transaction_id,
+                    rgar( $ret, 'transactionid' ),
+                    wp_get_current_user()->display_name,
+                    '' !== $note ? ' Note: ' . $note : ''
+                ),
+                'success'
+            );
+
+            $this->fire_status_updated( $entry_id, 'refund', array( 'type' => $type, 'amount' => number_format( $amount, 2, '.', '' ), 'refund_transaction_id' => (string) rgar( $ret, 'transactionid' ), 'note' => $note ) );
+
+            return '';
+        }
+
+        /** Sends a transact.php request (void, refund, subscription delete) and returns the parsed response. */
+        public function send_transaction( $params ) {
+            $response = wp_remote_post( GFORMMBN_KICBAC_API_BASE_URL . '/transact.php', array( 'timeout' => 45, 'body' => $params ) );
+
+            if ( is_wp_error( $response ) ) {
+                $this->log_error( __METHOD__ . '(): ' . $response->get_error_message() );
+
+                return array( 'responsetext' => $response->get_error_message() );
+            }
+
+            return gformmbn_kicbac_response_text_handler( wp_remote_retrieve_body( $response ) );
         }
 
         public function get_webhook_url() {
@@ -1062,7 +1363,12 @@ function gfmbn_kicbac_addon_bootstrap() {
             $subscription   = (array) rgar( $event, 'subscription' );
             $subscription_id = (string) ( rgar( $event, 'subscription_id' ) ?: rgar( $subscription, 'subscription_id' ) );
 
-            $entry_id = $this->find_entry_by_meta( 'transaction_id', $transaction_id );
+            $entry_id  = $this->find_entry_by_meta( 'transaction_id', $transaction_id );
+            $is_refund = (bool) preg_match( '/^transaction\.(refund|void)\./', $event_type );
+
+            if ( ! $entry_id && $is_refund ) {
+                $entry_id = $this->find_entry_by_meta( 'refund_transaction_id', $transaction_id );
+            }
 
             if ( ! $entry_id ) {
                 $entry_id = $this->find_entry_by_meta( 'subscription_id', $subscription_id );
@@ -1099,6 +1405,19 @@ function gfmbn_kicbac_addon_bootstrap() {
                 $meta[ $status[0] ] = $status[1];
             }
 
+            if ( $is_refund ) {
+                // A refund made here already recorded its own amount and status.
+                if ( in_array( $this->get_payment_meta( $entry_id, 'payment_status' ), array( 'Refunded', 'Partially Refunded', 'Voided' ), true ) ) {
+                    unset( $meta['payment_status'] );
+                }
+
+                $this->update_payment_meta( $entry_id, $meta );
+                $this->add_note( $entry_id, 'Kicbac webhook received: ' . $event_type, 'success' );
+                $this->fire_status_updated( $entry_id, 'webhook', array( 'event_type' => $event_type, 'event' => $event ) );
+
+                return new WP_REST_Response( array( 'message' => 'Processed.' ), 200 );
+            }
+
             if ( $transaction_id ) {
                 $meta['transaction_id'] = $transaction_id;
             }
@@ -1124,6 +1443,7 @@ function gfmbn_kicbac_addon_bootstrap() {
 
             $this->update_payment_meta( $entry_id, $meta );
             $this->add_note( $entry_id, 'Kicbac webhook received: ' . $event_type, 'success' );
+            $this->fire_status_updated( $entry_id, 'webhook', array( 'event_type' => $event_type, 'event' => $event ) );
 
             return new WP_REST_Response( array( 'message' => 'Processed.' ), 200 );
         }
@@ -1273,6 +1593,8 @@ function gfmbn_kicbac_addon_bootstrap() {
             foreach ( $pending['notes'] as $note ) {
                 $this->add_note( $entry['id'], $note[0], $note[1] );
             }
+
+            $this->fire_status_updated( $entry['id'], 'charge' );
 
             // Tokenized submissions never store card data in the first place, so there is
             // nothing to mask; only the legacy untokenized path needs scrubbing.
@@ -1665,11 +1987,16 @@ function gfmbn_kicbac_addon_bootstrap() {
             add_filter( 'gform_validation_message', array( $this, 'add_payment_error_message' ), 10, 2 );
             add_filter( 'gform_entry_detail_meta_boxes', array( $this, 'add_entry_meta_box' ), 10, 3 );
             add_action( 'rest_api_init', array( $this, 'register_webhook_route' ) );
+
+            require_once __DIR__ . '/supports/class-gform-klaviyo.php';
+            new GF_Kicbac_Klaviyo_Support( $this );
         }
 
         public function init_ajax() {
             parent::init_ajax();
             add_action( 'wp_ajax_gfmbn_kicbac_test_connection', array( $this, 'ajax_test_connection' ) );
+            add_action( 'wp_ajax_gfmbn_kicbac_refund', array( $this, 'ajax_refund' ) );
+            add_action( 'wp_ajax_gfmbn_kicbac_cancel_subscription', array( $this, 'ajax_cancel_subscription' ) );
         }
     }
 

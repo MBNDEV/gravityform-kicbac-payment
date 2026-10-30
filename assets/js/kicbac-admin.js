@@ -1,6 +1,7 @@
 /**
  * Repeatable product mapping rows on the form settings page, serialised into one hidden
- * input as JSON, and the Test Connection buttons on the plugin and form settings pages.
+ * input as JSON, the Test Connection buttons on the plugin and form settings pages, and the
+ * Refund and Cancel subscription controls on the entry detail page.
  */
 ( function () {
 	'use strict';
@@ -145,9 +146,96 @@
 		} );
 	}
 
+	function mountRefund( root ) {
+		var button = root.querySelector( 'button' );
+		var amount = root.querySelector( 'input' );
+		var status = root.querySelector( '.gfmbn-kicbac-refund-status' );
+		var labels = JSON.parse( root.dataset.labels );
+
+		button.addEventListener( 'click', function () {
+			var value = parseFloat( amount.value ).toFixed( 2 );
+			var body  = new FormData();
+
+			if ( ! window.confirm( labels.confirm.replace( '%s', value ) ) ) {
+				return;
+			}
+
+			body.append( 'action', 'gfmbn_kicbac_refund' );
+			body.append( 'nonce', root.dataset.nonce );
+			body.append( 'entry_id', root.dataset.entryId );
+			body.append( 'amount', value );
+			body.append( 'note', root.querySelector( '.gfmbn-kicbac-note' ).value );
+
+			button.disabled    = true;
+			status.style.color = '';
+			status.textContent = labels.refunding;
+
+			fetch( window.ajaxurl, { method: 'POST', credentials: 'same-origin', body: body } )
+				.then( function ( response ) { return response.json(); } )
+				.then( function ( result ) {
+					if ( result.success ) {
+						window.location.reload();
+						return;
+					}
+
+					status.style.color = '#d63638';
+					status.textContent = labels.failed + ( result.data && result.data.message ? ': ' + result.data.message : '' );
+					button.disabled    = false;
+				} )
+				.catch( function () {
+					status.style.color = '#d63638';
+					status.textContent = labels.failed;
+					button.disabled    = false;
+				} );
+		} );
+	}
+
+	function mountCancel( root ) {
+		var button = root.querySelector( 'button' );
+		var status = root.querySelector( '.gfmbn-kicbac-cancel-status' );
+		var labels = JSON.parse( root.dataset.labels );
+		var label  = button.textContent;
+
+		button.addEventListener( 'click', function () {
+			var body = new FormData();
+
+			if ( ! window.confirm( labels.confirm.replace( '%s', root.dataset.subscriptionId ) ) ) {
+				return;
+			}
+
+			body.append( 'action', 'gfmbn_kicbac_cancel_subscription' );
+			body.append( 'nonce', root.dataset.nonce );
+			body.append( 'entry_id', root.dataset.entryId );
+			body.append( 'subscription_id', root.dataset.subscriptionId );
+			body.append( 'note', root.querySelector( '.gfmbn-kicbac-note' ).value );
+
+			button.disabled    = true;
+			button.textContent = labels.cancelling;
+
+			fetch( window.ajaxurl, { method: 'POST', credentials: 'same-origin', body: body } )
+				.then( function ( response ) { return response.json(); } )
+				.then( function ( result ) {
+					if ( result.success ) {
+						window.location.reload();
+						return;
+					}
+
+					throw new Error( result.data && result.data.message ? result.data.message : '' );
+				} )
+				.catch( function ( error ) {
+					status.style.color = '#d63638';
+					status.textContent = labels.failed + ( error.message ? ': ' + error.message : '' );
+					button.disabled    = false;
+					button.textContent = label;
+				} );
+		} );
+	}
+
 	function init() {
 		document.querySelectorAll( '.gfmbn-kicbac-products' ).forEach( mount );
 		document.querySelectorAll( '.gfmbn-kicbac-connection' ).forEach( mountConnection );
+		document.querySelectorAll( '.gfmbn-kicbac-refund' ).forEach( mountRefund );
+		document.querySelectorAll( '.gfmbn-kicbac-cancel' ).forEach( mountCancel );
 	}
 
 	if ( 'loading' === document.readyState ) {
