@@ -14,7 +14,7 @@ function gfmbn_kicbac_addon_bootstrap() {
 
     class GF_Kicbac_AddOn extends GFAddOn {
 
-        protected $_version                  = '1.1.0';
+        protected $_version                  = '1.2.0';
         protected $_min_gravityforms_version = '2.7';
         protected $_slug                     = 'gravityform-kicbac-payment';
         protected $_path                     = 'gravityform-kicbac-payment/form-addon.php';
@@ -1279,8 +1279,8 @@ function gfmbn_kicbac_addon_bootstrap() {
         }
 
         /**
-         * Kicbac signs each delivery with a `webhook-signature: t=<ts>,v1=<hmac>` header,
-         * where the HMAC covers "<timestamp>.<raw body>".
+         * Kicbac signs each delivery with a `webhook-signature: t=<nonce>,s=<hmac>` header, where
+         * the HMAC-SHA256 covers "<nonce>.<raw body>". A v1= signature is accepted the same way.
          */
         public function is_valid_webhook_signature( $header, $body, $signing_key ) {
             if ( empty( $header ) ) {
@@ -1298,7 +1298,7 @@ function gfmbn_kicbac_addon_bootstrap() {
             }
 
             $timestamp = rgar( $parts, 't' );
-            $signature = rgar( $parts, 'v1' );
+            $signature = rgar( $parts, 's' ) ?: rgar( $parts, 'v1' );
 
             if ( ! $timestamp || ! $signature ) {
                 return false;
