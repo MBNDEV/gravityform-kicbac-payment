@@ -67,7 +67,7 @@ function gfmbn_kicbac_addon_bootstrap() {
                         'in_footer' => true,
                         'enqueue'   => array(
                             array(
-                                'admin_page' => array( 'form_settings' ),
+                                'admin_page' => array( 'form_settings', 'plugin_settings' ),
                                 'tab'        => $this->_slug,
                             ),
                         ),
@@ -323,11 +323,12 @@ function gfmbn_kicbac_addon_bootstrap() {
                             'name'              => 'api_key',
                             'label'             => esc_html__( 'Kicbac Security Key', 'gravityform-kicbac-payment' ),
                             'type'              => 'text',
-                            'input_type'        => 'password',
+                            'input_type'        => 'text',
                             'class'             => 'medium',
                             'required'          => true,
                             'feedback_callback' => array( $this, 'is_valid_api_key' )
                         ),
+                        $this->get_test_connection_field( 'api_key' ),
                         array(
                             'name'        => 'public_key',
                             'label'       => esc_html__( 'Public Security Key', 'gravityform-kicbac-payment' ),
@@ -339,7 +340,7 @@ function gfmbn_kicbac_addon_bootstrap() {
                             'name'        => 'webhook_signing_key',
                             'label'       => esc_html__( 'Webhook Signing Key', 'gravityform-kicbac-payment' ),
                             'type'        => 'text',
-                            'input_type'  => 'password',
+                            'input_type'  => 'text',
                             'class'       => 'medium',
                             'description' => sprintf(
                                 /* translators: %s: the webhook endpoint URL to paste into Kicbac. */
@@ -374,10 +375,11 @@ function gfmbn_kicbac_addon_bootstrap() {
                     'name'              => 'test_api_key',
                     'label'             => esc_html__( 'Test Security Key', 'gravityform-kicbac-payment' ),
                     'type'              => 'text',
-                    'input_type'        => 'password',
+                    'input_type'        => 'text',
                     'class'             => 'medium',
                     'feedback_callback' => array( $this, 'is_valid_form_api_key' ),
                 ),
+                $this->get_test_connection_field( 'test_api_key' ),
                 array(
                     'name'  => 'test_public_key',
                     'label' => esc_html__( 'Test Public Security Key', 'gravityform-kicbac-payment' ),
@@ -388,7 +390,7 @@ function gfmbn_kicbac_addon_bootstrap() {
                     'name'        => 'test_webhook_signing_key',
                     'label'       => esc_html__( 'Test Webhook Signing Key', 'gravityform-kicbac-payment' ),
                     'type'        => 'text',
-                    'input_type'  => 'password',
+                    'input_type'  => 'text',
                     'class'       => 'medium',
                     'description' => sprintf(
                         /* translators: %s: the webhook endpoint URL to paste into Kicbac. */
@@ -401,28 +403,110 @@ function gfmbn_kicbac_addon_bootstrap() {
 
         /** Validation from Kicbac API */
         public function is_valid_api_key( $value ) {
-          if( !$value ) {
-            return false;
-          }
-          $query_params = array(
-            'security_key' => $value,
-            'transaction_id' => strval( mt_rand( 1000000000, 9999999999 ) )
-          );
+            return '' !== trim( (string) $value ) && '' === $this->get_api_key_error( $value );
+        }
 
-          $response = wp_remote_get( GFORMMBN_KICBAC_API_BASE_URL . '/query.php?' . http_build_query( $query_params ));
+        /** Asks Kicbac whether a security key is accepted; returns its error message, or '' when connected. */
+        public function get_api_key_error( $value ) {
+            $value = trim( (string) $value );
 
-          if ( is_wp_error( $response ) ) {
-            return false;
-          }
+            if ( '' === $value ) {
+                return __( 'No security key entered.', 'gravityform-kicbac-payment' );
+            }
 
-          $body = wp_remote_retrieve_body( $response );
-          $ret = gformmbn_kicbac_response_xml_handler( $body );
-          
-          if( isset( $ret['error_response']) ) {
-            return false;
-          }
+            $query_params = array(
+                'security_key'   => $value,
+                'transaction_id' => strval( mt_rand( 1000000000, 9999999999 ) ),
+            );
 
-          return true;
+            $response = wp_remote_get( GFORMMBN_KICBAC_API_BASE_URL . '/query.php?' . http_build_query( $query_params ), array( 'timeout' => 20 ) );
+
+            if ( is_wp_error( $response ) ) {
+                return $response->get_error_message();
+            }
+
+            $ret = gformmbn_kicbac_response_xml_handler( wp_remote_retrieve_body( $response ) );
+
+            if ( ! is_array( $ret ) ) {
+                return __( 'Kicbac returned an unreadable response.', 'gravityform-kicbac-payment' );
+            }
+
+            if ( isset( $ret['error_response'] ) ) {
+                return is_string( $ret['error_response'] ) && '' !== $ret['error_response'] ? $ret['error_response'] : __( 'Kicbac rejected the security key.', 'gravityform-kicbac-payment' );
+            }
+
+            return '';
+        }
+
+        /** A Test Connection button settings field that checks the security key named in its key_field arg. */
+        public function get_test_connection_field( $key_field ) {
+            return array(
+                'name'          => $key_field . '_connection',
+                'label'         => esc_html__( 'Connection', 'gravityform-kicbac-payment' ),
+                'type'          => 'kicbac_test_connection',
+                'key_field'     => $key_field,
+                'save_callback' => '__return_empty_string',
+            );
+        }
+
+        /** Renders the Test Connection button and its status; kicbac-admin.js runs the check. */
+        public function settings_kicbac_test_connection( $field, $echo = true ) {
+            $form = $this->get_current_form();
+
+            $html = sprintf(
+                '<div class="gfmbn-kicbac-connection" data-key-field="%s" data-form-id="%d" data-nonce="%s" data-labels="%s">'
+                . '<button type="button" class="button">%s</button> <strong class="gfmbn-kicbac-connection-status" aria-live="polite"></strong>'
+                . '</div>',
+                esc_attr( rgobj( $field, 'key_field' ) ),
+                $form ? absint( rgar( $form, 'id' ) ) : 0,
+                esc_attr( wp_create_nonce( 'gfmbn_kicbac_test_connection' ) ),
+                esc_attr( wp_json_encode( array(
+                    'testing'      => __( 'Testing...', 'gravityform-kicbac-payment' ),
+                    'connected'    => __( 'Connected', 'gravityform-kicbac-payment' ),
+                    'disconnected' => __( 'Not Connected', 'gravityform-kicbac-payment' ),
+                ) ) ),
+                esc_html__( 'Test Connection', 'gravityform-kicbac-payment' )
+            );
+
+            if ( $echo ) {
+                echo $html; // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- escaped above.
+            }
+
+            return $html;
+        }
+
+        /** AJAX: tests the typed security key, or the saved one (form, then global) when the input is empty. */
+        public function ajax_test_connection() {
+            check_ajax_referer( 'gfmbn_kicbac_test_connection', 'nonce' );
+
+            if ( ! GFCommon::current_user_can_any( array( 'gravityforms_edit_settings', 'gravityforms_edit_forms' ) ) ) {
+                wp_send_json_error( array( 'message' => __( 'You are not allowed to test the connection.', 'gravityform-kicbac-payment' ) ), 403 );
+            }
+
+            $key_field = sanitize_key( wp_unslash( rgpost( 'key_field' ) ) );
+
+            if ( ! in_array( $key_field, array( 'api_key', 'test_api_key' ), true ) ) {
+                wp_send_json_error( array( 'message' => __( 'Unknown key.', 'gravityform-kicbac-payment' ) ), 400 );
+            }
+
+            $value = trim( sanitize_text_field( wp_unslash( rgpost( 'key' ) ) ) );
+            $form  = absint( rgpost( 'form_id' ) ) ? GFAPI::get_form( absint( rgpost( 'form_id' ) ) ) : null;
+
+            if ( '' === $value && $form ) {
+                $value = trim( (string) rgar( $this->get_form_settings( $form ), $key_field ) );
+            }
+
+            if ( '' === $value ) {
+                $value = trim( (string) rgar( $this->get_plugin_settings(), $key_field ) );
+            }
+
+            $error = $this->get_api_key_error( $value );
+
+            if ( '' !== $error ) {
+                wp_send_json_error( array( 'message' => $error ) );
+            }
+
+            wp_send_json_success();
         }
 
 
@@ -528,10 +612,11 @@ function gfmbn_kicbac_addon_bootstrap() {
                           'name'              => 'api_key',
                           'label'             => esc_html__( 'Kicbac Security Key', 'gravityform-kicbac-payment' ),
                           'type'              => 'text',
-                          'input_type'        => 'password',
+                          'input_type'        => 'text',
                           'class'             => 'medium',
                           'feedback_callback' => array( $this, 'is_valid_form_api_key' ),
                       ),
+                      $this->get_test_connection_field( 'api_key' ),
                       array(
                           'name'        => 'public_key',
                           'label'       => esc_html__( 'Public Security Key', 'gravityform-kicbac-payment' ),
@@ -543,7 +628,7 @@ function gfmbn_kicbac_addon_bootstrap() {
                           'name'        => 'webhook_signing_key',
                           'label'       => esc_html__( 'Webhook Signing Key', 'gravityform-kicbac-payment' ),
                           'type'        => 'text',
-                          'input_type'  => 'password',
+                          'input_type'  => 'text',
                           'class'       => 'medium',
                           'description' => sprintf(
                               /* translators: %s: the webhook endpoint URL to paste into Kicbac. */
@@ -805,6 +890,7 @@ function gfmbn_kicbac_addon_bootstrap() {
                 'payment_status'      => esc_html__( 'Payment Status', 'gravityform-kicbac-payment' ),
                 'payment_amount'      => esc_html__( 'Amount', 'gravityform-kicbac-payment' ),
                 'payment_date'        => esc_html__( 'Payment Date', 'gravityform-kicbac-payment' ),
+                'order_id'            => esc_html__( 'Order ID', 'gravityform-kicbac-payment' ),
                 'transaction_id'      => esc_html__( 'Transaction ID', 'gravityform-kicbac-payment' ),
                 'auth_code'           => esc_html__( 'Authorization Code', 'gravityform-kicbac-payment' ),
                 'subscription_status' => esc_html__( 'Subscription', 'gravityform-kicbac-payment' ),
@@ -1054,60 +1140,150 @@ function gfmbn_kicbac_addon_bootstrap() {
             return true;
         }
 
-        /** The main action: send entry to your API */
-        public function process_feed( $entry, $form ) {
+        /**
+         * Charges the submission once every other validation has passed, so a declined card
+         * fails the form instead of leaving an entry behind. The gateway message is shown on
+         * the payment field, or in the form's error summary when no payment field is visible.
+         */
+        public function charge_on_validation( $validation_result ) {
+            $form = $validation_result['form'];
 
-          $api_key = $this->get_credential( $form, 'api_key' );
-          $formsetting = rgar( $form, 'gravityform-kicbac-payment' );
+            if ( ! $validation_result['is_valid'] || ! $this->is_gateway_enabled( $form ) || 0 !== absint( rgpost( 'gform_target_page_number_' . absint( $form['id'] ) ) ) ) {
+                return $validation_result;
+            }
 
-          if( !rgar( $formsetting, 'enabled' ) ) {
-            // nothing to do if disabled.
-            return;
-          }
+            $this->pending = array( 'meta' => array(), 'notes' => array() );
+            $error         = $this->run_charges( GFFormsModel::create_lead( $form ), $form );
 
-            $token     = $this->get_submitted_token();
+            if ( '' === $error ) {
+                return $validation_result;
+            }
+
+            $this->pending = null;
+            $message       = sprintf(
+                /* translators: %s: the reason Kicbac gave for refusing the payment. */
+                esc_html__( 'Your payment could not be processed: %s. Please check your payment details and try again.', 'gravityform-kicbac-payment' ),
+                esc_html( rtrim( trim( preg_replace( '/\s*REFID:\S+/i', '', $error ) ), '.' ) )
+            );
+
+            $field = $this->get_payment_error_field( $form );
+
+            if ( $field ) {
+                $field->failed_validation  = true;
+                $field->validation_message = $message;
+            } else {
+                $this->payment_error = $message;
+            }
+
+            $validation_result['is_valid'] = false;
+            $validation_result['form']     = $form;
+
+            return $validation_result;
+        }
+
+        /** The field a payment error is shown on: the first visible mapped card or bank field. */
+        public function get_payment_error_field( $form ) {
+            $settings = $this->get_form_settings( $form );
+
+            foreach ( $this->get_kicbac_secure_fields() as $key ) {
+                $field = GFAPI::get_field( $form, absint( rgar( $settings, $key ) ) );
+
+                if ( $field && ! RGFormsModel::is_field_hidden( $form, $field, array() ) ) {
+                    return $field;
+                }
+            }
+
+            return null;
+        }
+
+        /** Adds the gateway's refusal to the error summary when no payment field could show it. */
+        public function add_payment_error_message( $message, $form ) {
+            return '' === $this->payment_error ? $message : $message . '<div class="gfmbn-kicbac-payment-error gform_validation_errors" role="alert"><p>' . $this->payment_error . '</p></div>';
+        }
+
+        /**
+         * Runs the gateway calls for a submission. Gateway meta and notes are written to the
+         * entry, or held in $pending while the entry does not exist yet.
+         *
+         * @return string The gateway error that stopped the payment before anything was charged, or '' otherwise.
+         */
+        public function run_charges( $entry, $form ) {
+            $api_key   = $this->get_credential( $form, 'api_key' );
             $params    = $this->build_gateway_params( $entry, $form, $api_key );
             $charges   = $this->get_charges( $form, $entry );
             $onetime   = $charges['onetime'];
             $schedules = $charges['recurring'];
+            $charged   = false;
+
+            $this->gateway_error = '';
 
             if ( ( $onetime > 0 ? 1 : 0 ) + count( $schedules ) > 1 ) {
-              // A Collect.js token can only be charged once, so a donor giving more than
-              // one gift is vaulted first and each gift is billed against the stored
-              // customer.
-              $vault_id = $this->process_customer_vault( $entry, $params );
+                // A Collect.js token can only be charged once, so a donor giving more than
+                // one gift is vaulted first and each gift is billed against the stored
+                // customer.
+                $vault_id = $this->process_customer_vault( $entry, $params );
 
-              if ( $vault_id ) {
+                if ( ! $vault_id ) {
+                    return $this->gateway_error;
+                }
+
                 $params = array(
-                  'security_key'      => $api_key,
-                  'customer_vault_id' => $vault_id,
+                    'security_key'      => $api_key,
+                    'customer_vault_id' => $vault_id,
                 );
-              } else {
-                $onetime   = 0;
-                $schedules = array();
-              }
             } elseif ( 0 === $onetime && empty( $schedules ) ) {
-              $this->process_customer_vault( $entry, $params );
+                return $this->process_customer_vault( $entry, $params ) ? '' : $this->gateway_error;
             }
 
+            $params['orderid'] = rgar( $entry, 'id' ) ? $entry['id'] : absint( $form['id'] ) . '-' . current_time( 'YmdHis' ) . '-' . wp_rand( 100, 999 );
+            $this->update_payment_meta( rgar( $entry, 'id' ), array( 'order_id' => $params['orderid'] ) );
+
             if ( $onetime > 0 ) {
-              $this->process_sale( $entry, $params, $onetime );
+                if ( ! $this->process_sale( $entry, $params, $onetime ) ) {
+                    return $this->gateway_error;
+                }
+
+                $charged = true;
             }
 
             foreach ( $schedules as $schedule ) {
-              $this->process_subscription( $entry, $params, $schedule );
+                if ( $this->process_subscription( $entry, $params, $schedule ) ) {
+                    $charged = true;
+                } elseif ( ! $charged ) {
+                    return $this->gateway_error;
+                }
+            }
+
+            return '';
+        }
+
+        /** Writes the gateway results held during validation to the new entry, and masks legacy card data. */
+        public function process_feed( $entry, $form ) {
+            $formsetting = rgar( $form, 'gravityform-kicbac-payment' );
+
+            if ( ! rgar( $formsetting, 'enabled' ) || null === $this->pending ) {
+                return;
+            }
+
+            $pending       = $this->pending;
+            $this->pending = null;
+
+            $this->update_payment_meta( absint( $entry['id'] ), $pending['meta'] );
+
+            foreach ( $pending['notes'] as $note ) {
+                $this->add_note( $entry['id'], $note[0], $note[1] );
             }
 
             // Tokenized submissions never store card data in the first place, so there is
             // nothing to mask; only the legacy untokenized path needs scrubbing.
-            if ( '' === $token ) {
-              foreach( $this->get_kicbac_secure_fields() as $value ) {
-                $formsetting_id = rgar( $formsetting, $value );
-                if ( ! empty( $formsetting_id ) ) {
-                  $secure_value = gformmbn_kicbac_secure_field( rgar( $entry, $formsetting_id ) );
-                  GFAPI::update_entry_field( $entry['id'], $formsetting_id, $secure_value );
+            if ( '' === $this->get_submitted_token() ) {
+                foreach ( $this->get_kicbac_secure_fields() as $value ) {
+                    $formsetting_id = rgar( $formsetting, $value );
+
+                    if ( ! empty( $formsetting_id ) ) {
+                        GFAPI::update_entry_field( $entry['id'], $formsetting_id, gformmbn_kicbac_secure_field( rgar( $entry, $formsetting_id ) ) );
+                    }
                 }
-              }
             }
         }
 
@@ -1237,29 +1413,29 @@ function gfmbn_kicbac_addon_bootstrap() {
             return wp_remote_post( GFORMMBN_KICBAC_API_BASE_URL . '/' . $endpoint . '?' . http_build_query( $params ) );
         }
 
-        /** Charges the one-time gift amount. */
+        /** Charges the one-time gift amount; true when Kicbac approves it. */
         public function process_sale( $entry, $params, $amount ) {
             $params['type']    = 'sale';
             $params['amount']  = number_format( $amount, 2, '.', '' );
-            $params['orderid'] = $entry['id'];
 
             $response = $this->post_to_gateway( 'transact.php', $params );
 
             if ( is_wp_error( $response ) ) {
-              $this->update_payment_meta( $entry['id'], array(
+              $this->update_payment_meta( rgar( $entry, 'id' ), array(
                 'payment_status' => 'Failed',
                 'payment_amount' => $params['amount'],
                 'response_text'  => $response->get_error_message(),
               ) );
-              $this->add_note( $entry['id'], 'Payment failed: API submission error', 'error' );
+              $this->record_note( $entry, 'Payment failed: API submission error', 'error' );
               $this->log_error( __METHOD__ . '(): ' . $response->get_error_message() );
-              return;
+              $this->gateway_error = $response->get_error_message();
+              return false;
             }
 
             $ret    = gformmbn_kicbac_response_text_handler( wp_remote_retrieve_body( $response ) );
             $status = $this->get_response_status( $ret );
 
-            $this->update_payment_meta( $entry['id'], array(
+            $this->update_payment_meta( rgar( $entry, 'id' ), array(
               'payment_status' => $status,
               'payment_amount' => $params['amount'],
               'payment_date'   => current_time( 'mysql' ),
@@ -1269,18 +1445,22 @@ function gfmbn_kicbac_addon_bootstrap() {
             ) );
 
             if ( 'Approved' === $status ) {
-              $this->add_note(
-                $entry['id'],
+              $this->record_note(
+                $entry,
                 sprintf( 'Payment approved for %s. Transaction ID %s', $params['amount'], rgar( $ret, 'transactionid' ) ),
                 'success'
               );
-            } else {
-              $this->add_note( $entry['id'], 'Payment was not approved: ' . rgar( $ret, 'responsetext' ), 'error' );
+              return true;
             }
+
+            $this->record_note( $entry, 'Payment was not approved: ' . rgar( $ret, 'responsetext' ), 'error' );
+            $this->gateway_error = $this->get_response_error( $ret );
+
+            return false;
         }
 
         /**
-         * Starts one recurring gift.
+         * Starts one recurring gift; true when Kicbac approves it.
          *
          * @param array $schedule { amount, months, payments } from get_charges().
          */
@@ -1291,44 +1471,48 @@ function gfmbn_kicbac_addon_bootstrap() {
             $params['month_frequency'] = $schedule['months'];
             // Clamped to 28 so a gift started on the 29th-31st still bills every cycle.
             $params['day_of_month']    = min( (int) current_time( 'j' ), 28 );
-            $params['orderid']         = $entry['id'];
 
             $cycle    = $this->get_billing_cycle_label( $schedule['months'], $schedule['payments'] );
             $response = $this->post_to_gateway( 'transact.php', $params );
 
             if ( is_wp_error( $response ) ) {
-              $this->add_subscription_meta( $entry['id'], array(
+              $this->add_subscription_meta( rgar( $entry, 'id' ), array(
                 'subscription_status' => 'Failed',
                 'subscription_amount' => $params['plan_amount'],
                 'billing_cycle'       => $cycle,
               ) );
-              $this->update_payment_meta( $entry['id'], array( 'response_text' => $response->get_error_message() ) );
-              $this->add_note( $entry['id'], 'Recurring gift failed: API submission error', 'error' );
+              $this->update_payment_meta( rgar( $entry, 'id' ), array( 'response_text' => $response->get_error_message() ) );
+              $this->record_note( $entry, 'Recurring gift failed: API submission error', 'error' );
               $this->log_error( __METHOD__ . '(): ' . $response->get_error_message() );
-              return;
+              $this->gateway_error = $response->get_error_message();
+              return false;
             }
 
             $ret    = gformmbn_kicbac_response_text_handler( wp_remote_retrieve_body( $response ) );
             $status = $this->get_response_status( $ret );
 
-            $this->add_subscription_meta( $entry['id'], array(
+            $this->add_subscription_meta( rgar( $entry, 'id' ), array(
               'subscription_status' => 'Approved' === $status ? 'Active' : $status,
               'subscription_id'     => rgar( $ret, 'subscription_id' ),
               'subscription_amount' => $params['plan_amount'],
               'billing_cycle'       => $cycle,
               'next_charge_date'    => 'Approved' === $status ? $this->calculate_next_charge_date( $params['day_of_month'], $schedule['months'] ) : '',
             ) );
-            $this->update_payment_meta( $entry['id'], array( 'response_text' => rgar( $ret, 'responsetext' ) ) );
+            $this->update_payment_meta( rgar( $entry, 'id' ), array( 'response_text' => rgar( $ret, 'responsetext' ) ) );
 
             if ( 'Approved' === $status ) {
-              $this->add_note(
-                $entry['id'],
+              $this->record_note(
+                $entry,
                 sprintf( 'Recurring gift started at %s, %s. Subscription ID %s', $params['plan_amount'], $cycle, rgar( $ret, 'subscription_id' ) ),
                 'success'
               );
-            } else {
-              $this->add_note( $entry['id'], 'Recurring gift was not started: ' . rgar( $ret, 'responsetext' ), 'error' );
+              return true;
             }
+
+            $this->record_note( $entry, 'Recurring gift was not started: ' . rgar( $ret, 'responsetext' ), 'error' );
+            $this->gateway_error = $this->get_response_error( $ret );
+
+            return false;
         }
 
         public function get_billing_cycle_label( $months, $payments ) {
@@ -1368,8 +1552,9 @@ function gfmbn_kicbac_addon_bootstrap() {
             $response = $this->post_to_gateway( 'transact.php', $params );
 
             if ( is_wp_error( $response ) ) {
-              $this->add_note( $entry['id'], 'Merchant has not been added to the vault: API Submission Error', 'error' );
+              $this->record_note( $entry, 'Merchant has not been added to the vault: API Submission Error', 'error' );
               $this->log_error( __METHOD__ . '(): ' . $response->get_error_message() );
+              $this->gateway_error = $response->get_error_message();
               return '';
             }
 
@@ -1378,13 +1563,14 @@ function gfmbn_kicbac_addon_bootstrap() {
             $ret = gformmbn_kicbac_response_text_handler( wp_remote_retrieve_body( $response ) );
 
             if ( isset( $ret['customer_vault_id'] ) ) {
-              $this->update_payment_meta( $entry['id'], array( 'customer_vault_id' => $ret['customer_vault_id'] ) );
-              $this->add_note( $entry['id'], 'Merchant has been added to the vault: Customer Vault ID ' . $ret['customer_vault_id'], 'success' );
+              $this->update_payment_meta( rgar( $entry, 'id' ), array( 'customer_vault_id' => $ret['customer_vault_id'] ) );
+              $this->record_note( $entry, 'Merchant has been added to the vault: Customer Vault ID ' . $ret['customer_vault_id'], 'success' );
 
               return (string) $ret['customer_vault_id'];
             }
 
-            $this->add_note( $entry['id'], 'Merchant has not been added to the vault: ' . rgar( $ret, 'responsetext' ), 'error' );
+            $this->record_note( $entry, 'Merchant has not been added to the vault: ' . rgar( $ret, 'responsetext' ), 'error' );
+            $this->gateway_error = $this->get_response_error( $ret );
 
             return '';
         }
@@ -1400,17 +1586,47 @@ function gfmbn_kicbac_addon_bootstrap() {
          */
         const META_PREFIX = 'kicbac_';
 
+        /** Gateway results charged during validation, held until the entry they belong to is created. */
+        private $pending = null;
+
+        /** The message of the last gateway call that failed. */
+        private $gateway_error = '';
+
+        /** The payment error shown on the form when validation stopped a charge. */
+        private $payment_error = '';
+
+        /** Writes entry meta, or holds it in $pending while the entry does not exist yet. */
         public function update_payment_meta( $entry_id, $data ) {
             foreach ( $data as $key => $value ) {
-                gform_update_meta( $entry_id, self::META_PREFIX . $key, $value );
+                if ( $entry_id ) {
+                    gform_update_meta( $entry_id, self::META_PREFIX . $key, $value );
+                } elseif ( null !== $this->pending ) {
+                    $this->pending['meta'][ $key ] = $value;
+                }
             }
         }
 
         public function get_payment_meta( $entry_id, $key, $default = '' ) {
             // gform_get_meta() returns false, not null, for a key that was never written.
-            $value = gform_get_meta( $entry_id, self::META_PREFIX . $key );
+            $value = $entry_id ? gform_get_meta( $entry_id, self::META_PREFIX . $key ) : rgars( $this->pending, 'meta/' . $key );
 
             return ( null === $value || false === $value || '' === $value ) ? $default : $value;
+        }
+
+        /** Adds an entry note, or holds it in $pending while the entry does not exist yet. */
+        public function record_note( $entry, $note, $type ) {
+            if ( rgar( $entry, 'id' ) ) {
+                $this->add_note( $entry['id'], $note, $type );
+            } elseif ( null !== $this->pending ) {
+                $this->pending['notes'][] = array( $note, $type );
+            }
+        }
+
+        /** The reason Kicbac gave for refusing a call. */
+        public function get_response_error( $ret ) {
+            $text = trim( (string) rgar( $ret, 'responsetext' ) );
+
+            return '' !== $text ? $text : __( 'The payment was declined', 'gravityform-kicbac-payment' );
         }
 
         /** Kicbac returns response=1 approved, 2 declined, 3 gateway error. */
@@ -1445,8 +1661,15 @@ function gfmbn_kicbac_addon_bootstrap() {
             add_action( 'gform_after_submission', array( $this, 'process_feed' ), 10, 2 );
             add_filter( 'script_loader_tag', array( $this, 'add_collectjs_attributes' ), 10, 2 );
             add_filter( 'gform_validation', array( $this, 'validate_payment_token' ) );
+            add_filter( 'gform_validation', array( $this, 'charge_on_validation' ), 1000 );
+            add_filter( 'gform_validation_message', array( $this, 'add_payment_error_message' ), 10, 2 );
             add_filter( 'gform_entry_detail_meta_boxes', array( $this, 'add_entry_meta_box' ), 10, 3 );
             add_action( 'rest_api_init', array( $this, 'register_webhook_route' ) );
+        }
+
+        public function init_ajax() {
+            parent::init_ajax();
+            add_action( 'wp_ajax_gfmbn_kicbac_test_connection', array( $this, 'ajax_test_connection' ) );
         }
     }
 

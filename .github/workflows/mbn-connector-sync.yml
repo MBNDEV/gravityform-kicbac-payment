@@ -1,0 +1,49 @@
+# Tells the MBN Dashboard Connector to re-sync this repository, so connected
+# sites pull the update. Copy this file unchanged into any theme or plugin
+# repository of an organization that has the connector's GitHub App installed.
+# No secrets are needed: the run authenticates with its GitHub OIDC token.
+# Set the repository variable MBN_CONNECTOR_URL only to target another connector.
+# Every branch push is sent; the connector skips branches its Feature Settings
+# do not pull, so this file never needs editing when that list changes.
+name: MBN Connector Sync
+
+on:
+  push:
+    branches: ['**']
+    tags: ['v*', 'staging*']
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: mbn-connector-sync-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      CONNECTOR_URL: ${{ vars.MBN_CONNECTOR_URL || 'https://wpdash.mybizniche.com' }}
+    steps:
+      - name: Request sync from the connector
+        run: |
+          set -euo pipefail
+          url="${CONNECTOR_URL%/}"
+          audience=$(jq -rn --arg u "${url}" '$u|@uri')
+          oidc=$(curl -sSf -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${audience}" | jq -r '.value')
+          status=$(curl -sS -o response.json -w '%{http_code}' --max-time 180 -X POST \
+            -H "Authorization: Bearer ${oidc}" \
+            -H "Content-Type: application/json" \
+            -d "{\"ref\":\"${GITHUB_REF}\",\"event\":\"${GITHUB_EVENT_NAME}\"}" \
+            "${url}/wp-json/mbn-connector/v1/ci-sync")
+          cat response.json; echo
+          if [ "${status}" -lt 200 ] || [ "${status}" -ge 300 ]; then
+            echo "::error::Connector sync failed with HTTP ${status}"
+            exit 1
+          fi
