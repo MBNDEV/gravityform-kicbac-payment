@@ -14,7 +14,7 @@ function gfmbn_kicbac_addon_bootstrap() {
 
     class GF_Kicbac_AddOn extends GFAddOn {
 
-        protected $_version                  = '1.0.2';
+        protected $_version                  = '1.1.0';
         protected $_min_gravityforms_version = '2.7';
         protected $_slug                     = 'gravityform-kicbac-payment';
         protected $_path                     = 'gravityform-kicbac-payment/form-addon.php';
