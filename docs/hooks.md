@@ -83,6 +83,20 @@ add_filter( 'gfmbn_kicbac_klaviyo_properties', function ( $properties, $entry, $
 }, 10, 3 );
 ```
 
+## `gfmbn_kicbac_allow_mixed_gifts` (filter)
+
+```php
+apply_filters( 'gfmbn_kicbac_allow_mixed_gifts', bool $allow, array $form );
+```
+
+A submission is charged during validation, before its entry exists, and refused (no entry, notification, feed or confirmation) when the payment is not approved. By default it is also refused, before any gateway call, when it carries both a one-time amount and a recurring gift, since one Collect.js token pays for one gift and splitting it needs the Customer Vault. Return `true` for a form whose Kicbac account has the Customer Vault and should accept both. When a later gift then fails, the gifts already approved are voided or cancelled and the submission is refused; if that undo fails too, the submission goes through with an error note on the entry.
+
+```php
+add_filter( 'gfmbn_kicbac_allow_mixed_gifts', function ( $allow, $form ) {
+	return 12 === (int) $form['id'] ? true : $allow;
+}, 10, 2 );
+```
+
 ## Entry data
 
 Every Kicbac value is stored as entry meta prefixed `kicbac_` (read with `gform_get_meta( $entry_id, 'kicbac_payment_status' )`), and refunds and cancellations add an entry note naming the admin and their note.
