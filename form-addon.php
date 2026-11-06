@@ -1461,36 +1461,143 @@ function gfmbn_kicbac_addon_bootstrap() {
         }
 
         /**
-         * Charges the submission once every other validation has passed, so a declined card
-         * fails the form instead of leaving an entry behind. The gateway message is shown on
-         * the payment field, or in the form's error summary when no payment field is visible.
+         * Charges the submission once every other validation has passed, so a declined card,
+         * gateway error or empty gift fails the form instead of leaving an entry behind. Each
+         * form is charged at most once per request, and a token is charged at most once
+         * across requests. The message is shown on the relevant field, or in the form's
+         * error summary when no such field is visible.
          */
         public function charge_on_validation( $validation_result ) {
-            $form = $validation_result['form'];
+            $form    = $validation_result['form'];
+            $form_id = absint( $form['id'] );
 
-            if ( ! $validation_result['is_valid'] || ! $this->is_gateway_enabled( $form ) || 0 !== absint( rgpost( 'gform_target_page_number_' . absint( $form['id'] ) ) ) ) {
+            if ( ! $validation_result['is_valid'] || ! $this->is_gateway_enabled( $form ) || 0 !== absint( rgpost( 'gform_target_page_number_' . $form_id ) ) ) {
                 return $validation_result;
+            }
+
+            if ( array_key_exists( $form_id, $this->validated ) ) {
+                $refusal = $this->validated[ $form_id ];
+
+                return null === $refusal ? $validation_result : $this->fail_validation( $validation_result, $refusal[0], $refusal[1] );
+            }
+
+            $entry   = GFFormsModel::create_lead( $form );
+            $refusal = $this->get_gift_refusal( $form, $entry );
+
+            if ( ! $refusal ) {
+                $refusal = $this->charge_submission( $entry, $form );
+            }
+
+            $this->validated[ $form_id ] = $refusal;
+
+            return null === $refusal ? $validation_result : $this->fail_validation( $validation_result, $refusal[0], $refusal[1] );
+        }
+
+        /**
+         * Runs the gateway calls for a validated submission under a lock on its token.
+         *
+         * @return array|null { field, message } when the payment was refused, null when it went through.
+         */
+        public function charge_submission( $entry, $form ) {
+            $lock = $this->lock_token();
+
+            if ( false === $lock ) {
+                $this->log_error( sprintf( '%s(): form %d: refused a second submission of a token that is already being charged.', __METHOD__, $form['id'] ) );
+
+                return array(
+                    $this->get_payment_error_field( $form ),
+                    esc_html__( 'Your payment is already being processed. Please wait a moment before submitting again.', 'gravityform-kicbac-payment' ),
+                );
             }
 
             $this->pending = array( 'meta' => array(), 'notes' => array() );
-            $error         = $this->run_charges( GFFormsModel::create_lead( $form ), $form );
+            $error         = $this->run_charges( $entry, $form );
 
             if ( '' === $error ) {
-                return $validation_result;
+                return null;
             }
 
+            $this->log_error( sprintf( '%s(): form %d payment refused: %s | %s', __METHOD__, $form['id'], $error, implode( ' | ', wp_list_pluck( $this->pending['notes'], 0 ) ) ) );
             $this->pending = null;
-            $message       = sprintf(
-                /* translators: %s: the reason Kicbac gave for refusing the payment. */
-                esc_html__( 'Your payment could not be processed: %s. Please check your payment details and try again.', 'gravityform-kicbac-payment' ),
-                esc_html( rtrim( trim( preg_replace( '/\s*REFID:\S+/i', '', $error ) ), '.' ) )
-            );
+            $this->unlock_token( $lock );
 
-            $field = $this->get_payment_error_field( $form );
+            return array(
+                $this->get_payment_error_field( $form ),
+                sprintf(
+                    /* translators: %s: the reason Kicbac gave for refusing the payment. */
+                    esc_html__( 'Your payment could not be processed: %s. Please check your payment details and try again.', 'gravityform-kicbac-payment' ),
+                    esc_html( rtrim( trim( preg_replace( '/\s*REFID:\S+/i', '', $error ) ), '.' ) )
+                ),
+            );
+        }
+
+        /**
+         * Refuses a gift the form cannot charge: a one-time amount and a recurring tier
+         * together (one Collect.js token pays for one gift, and the Customer Vault that
+         * would split it is not available on every account), or nothing chosen on a form
+         * that sells products. Both checks run before any gateway call.
+         *
+         * @return array|null { field, message } when the gift is refused, null otherwise.
+         */
+        public function get_gift_refusal( $form, $entry ) {
+            $mappings = $this->get_product_mappings( $form );
+
+            if ( empty( $mappings ) ) {
+                return null;
+            }
+
+            $charges = $this->get_charges( $form, $entry );
+
+            if ( $charges['onetime'] > 0 && ! empty( $charges['recurring'] ) && ! apply_filters( 'gfmbn_kicbac_allow_mixed_gifts', false, $form ) ) {
+                return array(
+                    $this->get_mapped_product_field( $form, $entry, 'recurring' ),
+                    esc_html__( 'Please choose either a one-time gift or a recurring gift, not both.', 'gravityform-kicbac-payment' ),
+                );
+            }
+
+            if ( 0 >= $charges['onetime'] && empty( $charges['recurring'] ) ) {
+                return array(
+                    $this->get_mapped_product_field( $form, $entry, 'onetime' ),
+                    esc_html__( 'Please choose a gift amount.', 'gravityform-kicbac-payment' ),
+                );
+            }
+
+            return null;
+        }
+
+        /**
+         * The first visible product field mapped to one-time billing, or to recurring billing,
+         * that a gift refusal is shown on.
+         *
+         * @param string $billing 'onetime' or 'recurring'.
+         */
+        public function get_mapped_product_field( $form, $entry, $billing ) {
+            foreach ( $this->get_product_mappings( $form ) as $row ) {
+                if ( ( 'onetime' === $row['billing'] ) !== ( 'onetime' === $billing ) ) {
+                    continue;
+                }
+
+                $field = GFAPI::get_field( $form, absint( $row['field_id'] ) );
+
+                if ( $field && ! RGFormsModel::is_field_hidden( $form, $field, array(), $entry ) ) {
+                    return $field;
+                }
+            }
+
+            return null;
+        }
+
+        /** Marks the submission invalid, with $message on $field or in the form's error summary. */
+        public function fail_validation( $validation_result, $field, $message ) {
+            $form = $validation_result['form'];
 
             if ( $field ) {
-                $field->failed_validation  = true;
-                $field->validation_message = $message;
+                foreach ( $form['fields'] as $form_field ) {
+                    if ( (int) $form_field->id === (int) $field->id ) {
+                        $form_field->failed_validation  = true;
+                        $form_field->validation_message = $message;
+                    }
+                }
             } else {
                 $this->payment_error = $message;
             }
@@ -1499,6 +1606,39 @@ function gfmbn_kicbac_addon_bootstrap() {
             $validation_result['form']     = $form;
 
             return $validation_result;
+        }
+
+        /**
+         * Claims the submitted Collect.js token so a double click or replayed POST cannot
+         * charge it twice. add_option() is an INSERT on a unique key, so only one request
+         * wins. The claim is dropped after a day.
+         *
+         * @return string|false|null The lock name, false when another request holds it, or null when there is no token.
+         */
+        public function lock_token() {
+            $token = $this->get_submitted_token();
+
+            if ( '' === $token ) {
+                return null;
+            }
+
+            $lock = 'gfmbn_kicbac_lock_' . md5( $token );
+
+            if ( ! add_option( $lock, time(), '', false ) ) {
+                return false;
+            }
+
+            wp_schedule_single_event( time() + DAY_IN_SECONDS, 'gfmbn_kicbac_release_lock', array( $lock ) );
+
+            return $lock;
+        }
+
+        /** Releases a token claim, so a refused payment can be retried. */
+        public function unlock_token( $lock ) {
+            if ( $lock ) {
+                delete_option( $lock );
+                wp_clear_scheduled_hook( 'gfmbn_kicbac_release_lock', array( $lock ) );
+            }
         }
 
         /** The field a payment error is shown on: the first visible mapped card or bank field. */
@@ -1523,9 +1663,12 @@ function gfmbn_kicbac_addon_bootstrap() {
 
         /**
          * Runs the gateway calls for a submission. Gateway meta and notes are written to the
-         * entry, or held in $pending while the entry does not exist yet.
+         * entry, or held in $pending while the entry does not exist yet. When a later gift
+         * fails, the gifts already approved are voided or cancelled so the submission can be
+         * refused as a whole; if that undo fails too, the submission goes through with the
+         * failure noted, since the donor has already been charged.
          *
-         * @return string The gateway error that stopped the payment before anything was charged, or '' otherwise.
+         * @return string The gateway error that stopped the payment with nothing left charged, or '' otherwise.
          */
         public function run_charges( $entry, $form ) {
             $api_key   = $this->get_credential( $form, 'api_key' );
@@ -1533,7 +1676,6 @@ function gfmbn_kicbac_addon_bootstrap() {
             $charges   = $this->get_charges( $form, $entry );
             $onetime   = $charges['onetime'];
             $schedules = $charges['recurring'];
-            $charged   = false;
 
             $this->gateway_error = '';
 
@@ -1558,26 +1700,79 @@ function gfmbn_kicbac_addon_bootstrap() {
             $params['orderid'] = rgar( $entry, 'id' ) ? $entry['id'] : absint( $form['id'] ) . '-' . current_time( 'YmdHis' ) . '-' . wp_rand( 100, 999 );
             $this->update_payment_meta( rgar( $entry, 'id' ), array( 'order_id' => $params['orderid'] ) );
 
-            if ( $onetime > 0 ) {
-                if ( ! $this->process_sale( $entry, $params, $onetime ) ) {
-                    return $this->gateway_error;
-                }
-
-                $charged = true;
+            if ( $onetime > 0 && ! $this->process_sale( $entry, $params, $onetime ) ) {
+                return $this->gateway_error;
             }
 
             foreach ( $schedules as $schedule ) {
                 if ( $this->process_subscription( $entry, $params, $schedule ) ) {
-                    $charged = true;
-                } elseif ( ! $charged ) {
-                    return $this->gateway_error;
+                    continue;
                 }
+
+                $error = $this->gateway_error;
+
+                if ( $this->undo_charges( $entry, $form, $api_key ) ) {
+                    return $error;
+                }
+
+                $this->record_note( $entry, 'A recurring gift failed after another gift was charged, and the charged gift could not be undone. Review this entry in Kicbac.', 'error' );
+                $this->log_error( sprintf( '%s(): form %d order %s: partial payment kept after a failed undo: %s', __METHOD__, $form['id'], $params['orderid'], $error ) );
+
+                return '';
             }
 
             return '';
         }
 
-        /** Writes the gateway results held during validation to the new entry, and masks legacy card data. */
+        /**
+         * Voids the approved one-time sale and cancels the approved subscriptions of the
+         * submission being charged.
+         *
+         * @return bool True when nothing approved is left on Kicbac.
+         */
+        public function undo_charges( $entry, $form, $api_key ) {
+            $undone         = true;
+            $transaction_id = 'Approved' === $this->get_payment_meta( rgar( $entry, 'id' ), 'payment_status' ) ? $this->get_payment_meta( rgar( $entry, 'id' ), 'transaction_id' ) : '';
+
+            if ( '' !== $transaction_id ) {
+                $ret    = $this->send_transaction( array(
+                    'security_key'  => $api_key,
+                    'type'          => 'void',
+                    'transactionid' => $transaction_id,
+                    'void_reason'   => 'user_cancel',
+                    'payment'       => 'check' === rgar( $entry, rgars( $form, 'gravityform-kicbac-payment/payment' ) ) ? 'check' : 'creditcard',
+                ) );
+                $voided = 'Approved' === $this->get_response_status( $ret );
+                $undone = $undone && $voided;
+
+                $this->record_note( $entry, $voided ? 'Voided transaction ' . $transaction_id . ' because a recurring gift failed.' : 'Could not void transaction ' . $transaction_id . ': ' . rgar( $ret, 'responsetext' ), $voided ? 'success' : 'error' );
+            }
+
+            $statuses = explode( ',', $this->get_payment_meta( rgar( $entry, 'id' ), 'subscription_status' ) );
+
+            foreach ( array_filter( explode( ',', $this->get_payment_meta( rgar( $entry, 'id' ), 'subscription_id' ) ) ) as $index => $subscription_id ) {
+                if ( 'Active' !== rgar( $statuses, $index ) ) {
+                    continue;
+                }
+
+                $ret       = $this->send_transaction( array(
+                    'security_key'    => $api_key,
+                    'recurring'       => 'delete_subscription',
+                    'subscription_id' => $subscription_id,
+                ) );
+                $cancelled = 'Approved' === $this->get_response_status( $ret );
+                $undone    = $undone && $cancelled;
+
+                $this->record_note( $entry, $cancelled ? 'Cancelled subscription ' . $subscription_id . ' because another recurring gift failed.' : 'Could not cancel subscription ' . $subscription_id . ': ' . rgar( $ret, 'responsetext' ), $cancelled ? 'success' : 'error' );
+            }
+
+            return $undone;
+        }
+
+        /**
+         * Writes the gateway results held during validation to the new entry before its
+         * feeds and notifications run, and masks legacy card data.
+         */
         public function process_feed( $entry, $form ) {
             $formsetting = rgar( $form, 'gravityform-kicbac-payment' );
 
@@ -1731,8 +1926,42 @@ function gfmbn_kicbac_addon_bootstrap() {
             return max( 0, $total );
         }
 
+        /** Posts $params to a Kicbac API endpoint in the request body, keeping keys and tokens out of URLs and logs. */
         public function post_to_gateway( $endpoint, $params ) {
-            return wp_remote_post( GFORMMBN_KICBAC_API_BASE_URL . '/' . $endpoint . '?' . http_build_query( $params ) );
+            return wp_remote_post( GFORMMBN_KICBAC_API_BASE_URL . '/' . $endpoint, array( 'timeout' => 45, 'body' => $params ) );
+        }
+
+        /**
+         * Asks Kicbac whether a sale for $order_id went through after its request failed in
+         * transit, so a charge that was approved is not reported to the donor as failed.
+         *
+         * @return array A transact.php-style response for the approved sale, or an empty array.
+         */
+        public function find_approved_sale( $api_key, $order_id ) {
+            $response = $this->post_to_gateway( 'query.php', array( 'security_key' => $api_key, 'order_id' => $order_id ) );
+
+            if ( is_wp_error( $response ) ) {
+                $this->log_error( __METHOD__ . '(): ' . $response->get_error_message() );
+
+                return array();
+            }
+
+            $result       = gformmbn_kicbac_response_xml_handler( wp_remote_retrieve_body( $response ) );
+            $transactions = rgar( (array) $result, 'transaction' );
+            $transactions = isset( $transactions['transaction_id'] ) ? array( $transactions ) : (array) $transactions;
+
+            foreach ( $transactions as $transaction ) {
+                if ( (string) rgar( $transaction, 'order_id' ) === (string) $order_id && in_array( rgar( $transaction, 'condition' ), array( 'pending', 'pendingsettlement', 'complete' ), true ) ) {
+                    return array(
+                        'response'      => '1',
+                        'responsetext'  => 'Approved',
+                        'transactionid' => (string) rgar( $transaction, 'transaction_id' ),
+                        'authcode'      => (string) rgar( $transaction, 'authorization_code' ),
+                    );
+                }
+            }
+
+            return array();
         }
 
         /** Charges the one-time gift amount; true when Kicbac approves it. */
@@ -1741,6 +1970,13 @@ function gfmbn_kicbac_addon_bootstrap() {
             $params['amount']  = number_format( $amount, 2, '.', '' );
 
             $response = $this->post_to_gateway( 'transact.php', $params );
+
+            $recovered = is_wp_error( $response ) ? $this->find_approved_sale( $params['security_key'], $params['orderid'] ) : array();
+
+            if ( $recovered ) {
+                $this->log_error( sprintf( '%s(): order %s: request failed (%s) but Kicbac recorded the sale as approved.', __METHOD__, $params['orderid'], $response->get_error_message() ) );
+                $response = array( 'body' => http_build_query( $recovered ) );
+            }
 
             if ( is_wp_error( $response ) ) {
               $this->update_payment_meta( rgar( $entry, 'id' ), array(
@@ -1917,6 +2153,9 @@ function gfmbn_kicbac_addon_bootstrap() {
         /** The payment error shown on the form when validation stopped a charge. */
         private $payment_error = '';
 
+        /** Outcome of charge_on_validation() per form ID in this request: null when charged, else { field, message }. */
+        private $validated = array();
+
         /** Writes entry meta, or holds it in $pending while the entry does not exist yet. */
         public function update_payment_meta( $entry_id, $data ) {
             foreach ( $data as $key => $value ) {
@@ -1979,8 +2218,8 @@ function gfmbn_kicbac_addon_bootstrap() {
         /** Optional: add form-level UI, validation, etc. */
         public function init() {
             parent::init();
-            // Register the action that triggers feed processing
-            add_action( 'gform_after_submission', array( $this, 'process_feed' ), 10, 2 );
+            add_action( 'gform_entry_created', array( $this, 'process_feed' ), 10, 2 );
+            add_action( 'gfmbn_kicbac_release_lock', 'delete_option' );
             add_filter( 'script_loader_tag', array( $this, 'add_collectjs_attributes' ), 10, 2 );
             add_filter( 'gform_validation', array( $this, 'validate_payment_token' ) );
             add_filter( 'gform_validation', array( $this, 'charge_on_validation' ), 1000 );
