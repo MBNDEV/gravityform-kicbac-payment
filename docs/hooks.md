@@ -40,6 +40,34 @@ Fields that are empty on the entry are left out. An entry that started more than
 
 Klaviyo segments and flows can use these directly, for example a "refund processed" email triggered when `kicbac_payment_status` changes to `Refunded`.
 
+## "Donation Approved" Klaviyo event
+
+Every submission whose payment is approved (a one-time gift charged or a subscription started) also records a `Donation Approved` event on the donor's Klaviyo profile, once, when the entry is saved. Declined or refused payments never send it, and neither do later subscription renewals. Use it to trigger a thank-you flow on every donation: a list-triggered flow only fires the first time someone joins the list, so repeat donors would get nothing.
+
+| Property | Value |
+|---|---|
+| `fund` | The mapped Company field, e.g. `General Fund`, `Cam Higby`, `Savannah Craven` |
+| `donation_type` | `one-time`, `recurring`, or `one-time and recurring` |
+| `amount` | Total charged at submission: one-time amount plus the first recurring amount (also the event's value) |
+| `one_time_amount`, `recurring_amount` | Each part, when present |
+| `billing_cycle` | e.g. `Monthly`, for a recurring gift |
+| `transaction_id`, `subscription_id` | Kicbac IDs, when present |
+| `payment_method` | `card` or `ach` |
+| `form`, `entry_id` | Gravity Forms title and entry ID |
+| `test_mode` | `true` when the form charges with the test keys |
+
+The event is keyed by the Kicbac order ID, so Klaviyo ignores a resend of the same donation. A failed send is logged and added as an entry note; it never affects the payment. The Klaviyo connection must be allowed to write events (`events:write` scope).
+
+Flow setup in Klaviyo: trigger the flow on the metric **Donation Approved**, with trigger filters `fund` equals the fund and `test_mode` is false (or one flow with a conditional split on `fund`). Retire the list-triggered thank-you flows, or first-time donors get two emails.
+
+## `gfmbn_kicbac_klaviyo_event` (filter)
+
+```php
+apply_filters( 'gfmbn_kicbac_klaviyo_event', array $event, array $entry, array $form );
+```
+
+Changes the Klaviyo Events API request body before it is sent. Return an empty array to skip the event for that entry.
+
 ## `gfmbn_kicbac_payment_status_updated` (action)
 
 ```php
