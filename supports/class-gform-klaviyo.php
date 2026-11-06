@@ -21,15 +21,128 @@ class GF_Kicbac_Klaviyo_Support {
 
     /**
      * Copies the entry's Kicbac details onto the donor's Klaviyo profile as kicbac_ properties,
-     * through the Gravity Forms Klaviyo connection, whenever its payment or subscription changes.
+     * through the Gravity Forms Klaviyo connection, whenever its payment or subscription changes,
+     * and records a "Donation Approved" event for each approved submission. A Klaviyo failure is
+     * logged and never undoes the payment, refund, cancellation or webhook that triggered it.
      */
     public function sync_klaviyo( $entry_id, $state, $source, $context ) {
         try {
             $this->send_to_klaviyo( $entry_id, $source, $context );
         } catch ( \Throwable $e ) {
-            // A Klaviyo problem must never undo a refund, cancellation or webhook that already happened.
             $this->addon->log_error( __METHOD__ . '(): ' . $e->getMessage() );
         }
+
+        if ( 'charge' !== $source ) {
+            return;
+        }
+
+        try {
+            $this->send_donation_event( $entry_id );
+        } catch ( \Throwable $e ) {
+            $this->addon->log_error( __METHOD__ . '(): ' . $e->getMessage() );
+        }
+    }
+
+    /** Records a "Donation Approved" Klaviyo event for the entry, so a flow can thank every donation, not only a donor's first. */
+    public function send_donation_event( $entry_id ) {
+        $klaviyo = function_exists( 'gf_klaviyo' ) ? gf_klaviyo() : null;
+        $entry   = GFAPI::get_entry( $entry_id );
+
+        if ( ! $klaviyo || ! $klaviyo->initialize_api() || is_wp_error( $entry ) ) {
+            return;
+        }
+
+        $form  = GFAPI::get_form( $entry['form_id'] );
+        $event = apply_filters( 'gfmbn_kicbac_klaviyo_event', $this->get_donation_event( $entry, $form ), $entry, $form );
+
+        if ( empty( $event ) ) {
+            return;
+        }
+
+        require_once __DIR__ . '/class-gform-klaviyo-events-api.php';
+
+        $api    = new GF_Kicbac_Klaviyo_Events_API( $klaviyo->get_auth_settings(), $klaviyo );
+        $result = $api->create_event( $event );
+
+        if ( is_wp_error( $result ) ) {
+            $this->addon->log_error( __METHOD__ . '(): Klaviyo event failed: ' . $result->get_error_message() );
+            $this->addon->add_note( $entry_id, 'Donation Approved event was not sent to Klaviyo: ' . $result->get_error_message(), 'error' );
+
+            return;
+        }
+
+        $this->addon->add_note( $entry_id, 'Donation Approved event sent to Klaviyo.', 'success' );
+    }
+
+    /**
+     * The Klaviyo "Donation Approved" event for an entry whose one-time gift was approved or
+     * whose subscription started, keyed by the order ID so a resend is not counted twice.
+     *
+     * @return array The Klaviyo API request body, or an empty array when there is nothing to report.
+     */
+    public function get_donation_event( $entry, $form ) {
+        $entry_id  = absint( $entry['id'] );
+        $settings  = (array) rgar( $form, 'gravityform-kicbac-payment' );
+        $email     = sanitize_email( rgar( $entry, rgar( $settings, 'email' ) ) );
+        $onetime   = 'Approved' === $this->addon->get_payment_meta( $entry_id, 'payment_status' ) ? (float) $this->addon->get_payment_meta( $entry_id, 'payment_amount', 0 ) : 0;
+        $statuses  = explode( ',', $this->addon->get_payment_meta( $entry_id, 'subscription_status' ) );
+        $amounts   = explode( ',', $this->addon->get_payment_meta( $entry_id, 'subscription_amount' ) );
+        $recurring = 0;
+
+        foreach ( $statuses as $index => $status ) {
+            if ( 'Active' === $status ) {
+                $recurring += (float) rgar( $amounts, $index );
+            }
+        }
+
+        if ( ! is_email( $email ) || ( $onetime <= 0 && $recurring <= 0 ) ) {
+            return array();
+        }
+
+        $amount     = round( $onetime + $recurring, 2 );
+        $properties = array_filter(
+            array(
+                'fund'             => (string) rgar( $entry, rgar( $settings, 'company' ) ),
+                'donation_type'    => $onetime > 0 && $recurring > 0 ? 'one-time and recurring' : ( $onetime > 0 ? 'one-time' : 'recurring' ),
+                'amount'           => $amount,
+                'one_time_amount'  => $onetime > 0 ? $onetime : null,
+                'recurring_amount' => $recurring > 0 ? $recurring : null,
+                'billing_cycle'    => $recurring > 0 ? $this->addon->get_payment_meta( $entry_id, 'billing_cycle' ) : null,
+                'transaction_id'   => $onetime > 0 ? $this->addon->get_payment_meta( $entry_id, 'transaction_id' ) : null,
+                'subscription_id'  => $recurring > 0 ? $this->addon->get_payment_meta( $entry_id, 'subscription_id' ) : null,
+                'payment_method'   => 'check' === rgar( $entry, rgar( $settings, 'payment' ) ) ? 'ach' : 'card',
+                'form'             => (string) rgar( $form, 'title' ),
+                'entry_id'         => $entry_id,
+            ),
+            function ( $value ) {
+                return null !== $value && '' !== $value;
+            }
+        );
+
+        $properties['test_mode'] = $this->addon->is_test_mode( $form );
+
+        return array(
+            'data' => array(
+                'type'       => 'event',
+                'attributes' => array(
+                    'properties'     => $properties,
+                    'value'          => $amount,
+                    'value_currency' => rgar( $entry, 'currency' ) ? $entry['currency'] : 'USD',
+                    'unique_id'      => $this->addon->get_payment_meta( $entry_id, 'order_id', 'entry-' . $entry_id ),
+                    'metric'         => array( 'data' => array( 'type' => 'metric', 'attributes' => array( 'name' => 'Donation Approved' ) ) ),
+                    'profile'        => array(
+                        'data' => array(
+                            'type'       => 'profile',
+                            'attributes' => array_filter( array(
+                                'email'      => $email,
+                                'first_name' => (string) rgar( $entry, rgar( $settings, 'first_name' ) ),
+                                'last_name'  => (string) rgar( $entry, rgar( $settings, 'last_name' ) ),
+                            ) ),
+                        ),
+                    ),
+                ),
+            ),
+        );
     }
 
     /** Looks up or creates the donor's Klaviyo profile and writes the entry's kicbac_ properties to it. */
