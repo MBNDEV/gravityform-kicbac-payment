@@ -55,10 +55,13 @@ Every submission whose payment is approved (a one-time gift charged or a subscri
 | `payment_method` | `card` or `ach` |
 | `form`, `entry_id` | Gravity Forms title and entry ID |
 | `test_mode` | `true` when the form charges with the test keys |
+| `first_donation` | `true` when the donor was on none of the Klaviyo lists this donation's Gravity Forms Klaviyo feeds add them to (e.g. General Fund Donors), checked before those feeds run; `false` otherwise. Left out when no Klaviyo feed applies or Klaviyo could not be asked. |
 
 The event is keyed by the Kicbac order ID, so Klaviyo ignores a resend of the same donation. A failed send is logged and added as an entry note; it never affects the payment. The Klaviyo connection must be allowed to write events (`events:write` scope).
 
 Flow setup in Klaviyo: trigger the flow on the metric **Donation Approved**, with trigger filters `fund` equals the fund and `test_mode` is false (or one flow with a conditional split on `fund`). Retire the list-triggered thank-you flows, or first-time donors get two emails.
+
+To thank first-time and repeat donors differently, split on the event, not on list membership: add a **Trigger split** on `first_donation` equals true. A conditional split on "is in list" cannot work, because the Gravity Forms Klaviyo feed adds the donor to the fund list seconds after the donation, before Klaviyo reaches the split, so every donor looks like a repeat donor.
 
 ## `gfmbn_kicbac_klaviyo_event` (filter)
 

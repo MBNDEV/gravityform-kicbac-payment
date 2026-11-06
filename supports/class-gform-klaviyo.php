@@ -52,16 +52,26 @@ class GF_Kicbac_Klaviyo_Support {
             return;
         }
 
+        require_once __DIR__ . '/class-gform-klaviyo-events-api.php';
+
+        $api   = new GF_Kicbac_Klaviyo_Events_API( $klaviyo->get_auth_settings(), $klaviyo );
         $form  = GFAPI::get_form( $entry['form_id'] );
-        $event = apply_filters( 'gfmbn_kicbac_klaviyo_event', $this->get_donation_event( $entry, $form ), $entry, $form );
+        $event = $this->get_donation_event( $entry, $form );
+
+        if ( ! empty( $event ) ) {
+            $first = $this->is_first_donation( $api, $entry, $form, rgars( $event, 'data/attributes/profile/data/attributes/email' ) );
+
+            if ( null !== $first ) {
+                $event['data']['attributes']['properties']['first_donation'] = $first;
+            }
+        }
+
+        $event = apply_filters( 'gfmbn_kicbac_klaviyo_event', $event, $entry, $form );
 
         if ( empty( $event ) ) {
             return;
         }
 
-        require_once __DIR__ . '/class-gform-klaviyo-events-api.php';
-
-        $api    = new GF_Kicbac_Klaviyo_Events_API( $klaviyo->get_auth_settings(), $klaviyo );
         $result = $api->create_event( $event );
 
         if ( is_wp_error( $result ) ) {
@@ -72,6 +82,54 @@ class GF_Kicbac_Klaviyo_Support {
         }
 
         $this->addon->add_note( $entry_id, 'Donation Approved event sent to Klaviyo.', 'success' );
+    }
+
+    /**
+     * Whether this is the donor's first gift to the fund: true when they are on none of the
+     * Klaviyo lists that this entry's Gravity Forms Klaviyo feeds add them to. Asked before
+     * those feeds run, so the answer describes the donor as they were before this donation.
+     *
+     * @return bool|null Null when it cannot be told: no Klaviyo feed applies, or Klaviyo did not answer.
+     */
+    public function is_first_donation( $api, $entry, $form, $email ) {
+        $klaviyo = gf_klaviyo();
+        $lists   = array();
+
+        foreach ( (array) $klaviyo->get_active_feeds( $form['id'] ) as $feed ) {
+            $list = (string) rgars( $feed, 'meta/list' );
+
+            if ( '' !== $list && $klaviyo->is_feed_condition_met( $feed, $form, $entry ) ) {
+                $lists[] = $list;
+            }
+        }
+
+        if ( empty( $lists ) || ! is_email( $email ) ) {
+            return null;
+        }
+
+        $found = $api->get_profile_by_email( $email );
+
+        if ( is_wp_error( $found ) ) {
+            $this->addon->log_error( __METHOD__ . '(): Klaviyo profile lookup failed: ' . $found->get_error_message() );
+
+            return null;
+        }
+
+        $profile_id = (string) rgars( $found, 'data/0/id' );
+
+        if ( '' === $profile_id ) {
+            return true;
+        }
+
+        $on_lists = $api->get_profile_list_ids( $profile_id );
+
+        if ( is_wp_error( $on_lists ) ) {
+            $this->addon->log_error( __METHOD__ . '(): Klaviyo list lookup failed: ' . $on_lists->get_error_message() );
+
+            return null;
+        }
+
+        return ! array_intersect( $lists, $on_lists );
     }
 
     /**
